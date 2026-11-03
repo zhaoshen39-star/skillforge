@@ -271,7 +271,7 @@ def main() -> int:
 
         # Q. meta 记录升级
         raw = json.loads((out / "meta.json").read_text(encoding="utf-8"))
-        check(raw.get("version") == "0.2.0", "Q1 meta.version 为 0.2.0")
+        check(raw.get("version") == "0.3.0", "Q1 meta.version 为 0.3.0")
         check(raw.get("profile") == "dsh", "Q2 meta.profile 默认为 dsh")
         check(len(raw.get("source_files", [])) >= 3, "Q3 meta 记录源文件哈希")
         check(bool(raw.get("source_root")), "Q4 meta 记录 source_root")
@@ -281,6 +281,58 @@ def main() -> int:
         check(p.returncode != 0, "R1 非空输出目录默认拒绝覆盖")
         p = run("build", str(demo), "-o", str(out), "--force")
         check(p.returncode == 0, "R2 --force 允许覆盖")
+
+        # S. install：装进 skills 根目录并回读校验
+        inst_root = tmp / "skills-root"
+        p = run("install", str(out), "--dir", str(inst_root))
+        check(p.returncode == 0, "S1 install 退出码 0")
+        check((inst_root / "tinycalc" / "SKILL.md").exists(), "S2 install 落地 SKILL.md")
+        check("引用文件齐全" in p.stdout, "S3 install 回读校验引用文件")
+        p = run("install", str(out), "--dir", str(inst_root))
+        check(p.returncode != 0, "S4 重复 install 默认拒绝")
+        p = run("install", str(out), "--dir", str(inst_root), "--force")
+        check(p.returncode == 0, "S5 --force 允许覆盖安装")
+        p = run("install", "--list", "--dir", str(inst_root), "--json")
+        try:
+            listed = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            listed = {}
+        check(any(s["name"] == "tinycalc" for s in listed.get("skills", [])), "S6 --list 列出已装 skill")
+        junk_root = tmp / "skills-junk"
+        p = run("install", str(tmp / "bad"), "--dir", str(junk_root))
+        check(p.returncode != 0 and "体检" in (p.stdout + p.stderr), "S7 低分 skill 默认拒绝安装")
+        p = run("install", str(out), "--dir", str(tmp / "skills-dry"), "--dry-run")
+        check(p.returncode == 0 and "[dry-run]" in p.stdout, "S8 install --dry-run 只打印计划")
+        check(not (tmp / "skills-dry" / "tinycalc").exists(), "S9 dry-run 不落盘")
+        p = run("install", str(out), "--dir", str(inst_root), "--uninstall")
+        check(p.returncode == 0 and not (inst_root / "tinycalc").exists(), "S10 --uninstall 删除安装")
+        p = run("install", str(tmp / "does-not-exist"))
+        check(p.returncode != 0, "S11 install 不存在的包报错")
+        p = run("install", str(inst_root), "--dir", str(inst_root))
+        check(p.returncode != 0, "S12 install 非 skill 目录报错")
+
+        # T. lint --all：批量扫描 skills 根目录
+        audit_root = tmp / "audit-root"
+        run("install", str(out), "--dir", str(audit_root))
+        good_skill = audit_root / "tinycalc" / "SKILL.md"
+        check(good_skill.exists(), "T1 为批量体检准备一个健康 skill")
+        (audit_root / "junk").mkdir(exist_ok=True)
+        (audit_root / "junk" / "SKILL.md").write_text("# junk\n\nTODO\n", encoding="utf-8")
+        p = run("lint", "--all", "--roots", str(audit_root))
+        check(p.returncode == 1, "T2 存在低分 skill 时退出码 1")
+        check("tinycalc" in p.stdout and "junk" in p.stdout, "T3 列出所有 skill")
+        p = run("lint", "--all", "--roots", str(audit_root), "--json")
+        try:
+            summary = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            summary = {}
+        check(summary.get("total") == 2, "T4 --all --json 统计总数")
+        check(summary.get("below") == 1, "T5 --all --json 统计不达标数")
+        shutil.rmtree(audit_root / "junk")
+        p = run("lint", "--all", "--roots", str(audit_root))
+        check(p.returncode == 0, "T6 全部达标时退出码 0")
+        p = run("lint", "--all", "--roots", str(tmp / "no-such-root"))
+        check(p.returncode == 1, "T7 根目录不存在时退出码 1")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

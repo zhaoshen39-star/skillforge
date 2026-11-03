@@ -43,3 +43,7 @@ jobs:
 
       - name: Score gate (CI threshold)
         run: python skillforge.py score out/self-skill --min 90
+
+      - name: Install + lint --all round-trip
+        run: |
+          python -c "import subprocess,sys,tempfile,pathlib; d=tempfile.mkdtemp(); run=lambda a: subprocess.run([sys.executable,'skillforge.py']+a).returncode; ok = run(['install','out/self-skill','--dir',d])==0 and (pathlib.Path(d)/'skillforge'/'SKILL.md').exists() and run(['install','--list','--dir',d,'--json'])==0 and run(['lint','--all','--roots',d,'--min','90'])==0 and run(['install','out/self-skill','--dir',d,'--uninstall'])==0; print('install round-trip:', 'ok' if ok else 'FAILED'); sys.exit(0 if ok else 1)"

@@ -7,12 +7,14 @@
 ![dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
+![demo: build → lint (46/100) → fix (94/100) → score](docs/demo.gif)
+
 Most "skill generators" are prompt templates: you paste a README into an LLM and hope.
 `skillforge` is the boring, auditable version:
 
 - **Deterministic** — same input, byte-identical output. No model in the loop.
 - **Zero dependencies** — pure Python standard library.
-- **Full loop** — generate a skill, audit it, auto-fix the mechanical failures, and detect when it goes stale.
+- **Full loop** — generate a skill, install it into the runtime, audit it, auto-fix the mechanical failures, and detect when it goes stale.
 - **Honest** — it never invents facts; anything missing is listed under *known gaps*.
 
 ```
@@ -24,8 +26,9 @@ source (repo / dir / PDF / URL)
         ▼
    audit score (12 weighted checks) → 0–100 + letter grade
         │
-        ├─ fix   → repair name / description / whenToUse / dangling refs
-        └─ diff  → did the source change since generation?
+        ├─ install → copy into $DSH_HOME/skills or ~/.claude/skills, then re-read and verify
+        ├─ fix     → repair name / description / whenToUse / dangling refs
+        └─ diff    → did the source change since generation?
 ```
 
 ## Quick start
@@ -47,7 +50,11 @@ python skillforge.py build ./paper.pdf -o out/paper-skill
 python skillforge.py lint out/my-skill
 python skillforge.py fix  out/my-skill
 
-# 5) later: is the skill still in sync with the source?
+# 5) install it where the runtime will actually find it
+python skillforge.py install out/my-skill            # → $DSH_HOME/skills/<name>, re-read & verified
+python skillforge.py install out/my-skill --target claude   # → ~/.claude/skills/<name>
+
+# 6) later: is the skill still in sync with the source?
 python skillforge.py diff out/my-skill
 ```
 
@@ -68,6 +75,43 @@ python skillforge.py build ./my-repo -o out/skill --profile generic
 ```
 
 `--dry-run` shows exactly what would be generated and what it would score, without writing anything.
+
+## Install it (the part everyone forgets)
+
+Generating a skill is useless if the runtime never sees it. `install` copies the bundle into the
+skills root, then **reads it back** and verifies the three things that silently break loading:
+
+```bash
+$ python skillforge.py install out/my-skill
+已安装：/home/me/.dsh/skills/my-skill
+  ✓ SKILL.md 已就位
+  ✓ frontmatter name 与目录名一致
+  ✓ 引用文件齐全（3/3）
+  体检：100/100（A）
+  下一步：在 DSH 工作区里启用该技能（技能管理 ↵ 工作区技能开关）。
+```
+
+- `--target dsh` → `$DSH_HOME/skills` (or `~/.dsh/skills`), auto-detected
+- `--target claude` → `~/.claude/skills`
+- `--dir PATH` → anywhere else (useful in CI)
+- `--list` / `--uninstall` / `--dry-run` / `--force`; a bundle scoring under 60 is refused unless forced
+
+## Audit a whole library: `lint --all`
+
+Once you have more than three skills, the question stops being "is this one good" and becomes
+"which of these won't load". `lint --all` scans every skills root it can find (or `--roots` you name):
+
+```bash
+$ python skillforge.py lint --all --roots ~/.dsh/skills
+共 3 个 skill（门禁 ≥75）
+  ✓ tinycalc                     100/100 A   /home/me/.dsh/skills/tinycalc
+  ✗ my-old-skill                  62/100 C   /home/me/.dsh/skills/my-old-skill
+      · frontmatter name "My Old Skill" is not kebab-case
+  ✓ paper-notes                  100/100 A   /home/me/.dsh/skills/paper-notes
+结论：2/3 达标，1 个低于门禁
+```
+
+Exit code is `1` if anything is below `--min` (default 75), so it drops straight into CI.
 
 ## What you get
 
@@ -199,6 +243,9 @@ Exit codes are CI-friendly: `0` healthy, `1` unhealthy.
 python skillforge.py build  <source> [-o OUT] [--name NAME] [--profile dsh|claude|generic]
                                       [--budget N] [--force] [--dry-run] [--json]
 python skillforge.py lint   <skill-dir> [--json]
+python skillforge.py lint   --all [--roots ROOT ...] [--min 75] [--json]
+python skillforge.py install <skill-dir> [--target auto|dsh|claude] [--dir PATH]
+                                      [--force] [--dry-run] [--uninstall] [--list] [--json]
 python skillforge.py fix    <skill-dir> [--force] [--json]
 python skillforge.py diff   <skill-dir> [--json]        # 0 in sync, 1 stale
 python skillforge.py score  <skill-dir> [--min N] [--json]
@@ -210,18 +257,20 @@ python skillforge.py --version
 
 ## Chinese
 
-**把任意 repo / 文档 / PDF 变成 agent skill，并给它打分、体检、自动修、检查是否过期。**
+**把任意 repo / 文档 / PDF 变成 agent skill，并给它打分、体检、自动修、装进运行时、检查是否过期。**
 
 - 同一输入 → 完全相同的输出（不调模型，不掷骰子）
 - 纯标准库，零第三方依赖
-- 五条命令形成闭环：`build` 生成 → `lint` 体检 → `fix` 修机械问题 → `diff` 查过期 → `score` 做 CI 门禁
+- 六条命令形成闭环：`build` 生成 → `lint` 体检（可 `--all` 批量）→ `fix` 修机械问题 → `install` 装进 DSH/Claude 并回读校验 → `diff` 查过期 → `score` 做 CI 门禁
 - 不编造事实：源材料没写的，就列进「待补充」；`fix` 只改结构不改内容
 
 ```bash
 python skillforge.py build ./my-repo -o out/my-skill --profile dsh
 python skillforge.py lint out/my-skill
 python skillforge.py fix  out/my-skill
-python skillforge.py diff out/my-skill     # 源变了就退出码 1
+python skillforge.py install out/my-skill                 # 直接装进 $DSH_HOME/skills
+python skillforge.py lint --all ~/.dsh/skills             # 批量体检
+python skillforge.py diff out/my-skill                    # 源变了就退出码 1
 ```
 
 生成出来的 `SKILL.md` 是固定骨架：是什么/什么时候用 → 核心内容 → 快速开始 → 关键概念 → 参考文件 → 待补充 → 维护。
@@ -232,9 +281,21 @@ python skillforge.py diff out/my-skill     # 源变了就退出码 1
 - [x] `diff` — detect outdated skills by hashing source files
 - [x] `fix` — auto-repair the mechanical lint failures
 - [x] `--dry-run` — preview before writing
+- [x] `install` — copy into DSH/Claude skills root and verify it will be discovered
+- [x] `lint --all` — audit a whole skills library, CI-friendly exit code
+- [ ] prompt-injection scan for skills generated from untrusted web pages
 - [ ] `--from-tests` — derive `whenToUse` from example user queries
 - [ ] PDF layout handling beyond text extraction (`pypdf` optional)
 - [ ] `build --watch` — regenerate on source change
+
+## Tests
+
+```bash
+python tests/verify_skillforge.py    # 85 checks, offline, no network
+python skillforge.py selftest        # 11 built-in checks on a fixture repo
+```
+
+CI runs both on Linux and Windows, Python 3.9 and 3.12.
 
 ## License
 

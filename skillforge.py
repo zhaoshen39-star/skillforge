@@ -44,7 +44,7 @@ try:  # 让 Windows 控制台也能输出中文/✓
 except Exception:
     pass
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # skill 运行时的 frontmatter 习惯不同：
 #   dsh     — name / description / whenToUse（DSH 会读 whenToUse 做路由）
@@ -928,6 +928,139 @@ def _write_bundle(out: Path, skill_md: str, refs: list[tuple[str, str]], meta: d
                                    encoding="utf-8")
 
 
+SKILL_TARGETS = ("auto", "dsh", "claude")
+
+
+def skill_root(target: str = "auto") -> tuple[str, Path]:
+    """返回 (实际目标名, skills 根目录)。
+
+    dsh   → $DSH_HOME/skills（未设 DSH_HOME 时 ~/.dsh/skills）
+    claude→ ~/.claude/skills
+    auto  → 已存在的那个；都没有时按 dsh 创建
+    """
+    home = Path.home()
+    dsh_home = Path(os.environ["DSH_HOME"]) if os.environ.get("DSH_HOME") else home / ".dsh"
+    roots = {
+        "dsh": dsh_home / "skills",
+        "claude": home / ".claude" / "skills",
+    }
+    if target == "auto":
+        if dsh_home.exists():
+            target = "dsh"
+        elif roots["claude"].parent.exists():
+            target = "claude"
+        else:
+            target = "dsh"
+    return target, roots[target]
+
+
+def installed_name(bundle: Path) -> str:
+    text = read_text(bundle / "SKILL.md") if (bundle / "SKILL.md").exists() else ""
+    fm = parse_frontmatter(text)
+    return slugify(fm.get("name") or bundle.name)
+
+
+def _verify_install(dest: Path, name: str) -> list[tuple[str, bool]]:
+    text = read_text(dest / "SKILL.md") if (dest / "SKILL.md").exists() else ""
+    fm = parse_frontmatter(text)
+    # 只认真正的文件名；正文里的「…见 references/）」「references/ 目录」不算引用
+    refs = sorted(set(re.findall(r"references/([A-Za-z0-9_.\-]+\.[A-Za-z0-9]+)", text)))
+    missing = [r for r in refs if not (dest / "references" / r).exists()]
+    return [
+        ("SKILL.md 已就位", (dest / "SKILL.md").exists()),
+        ("frontmatter name 与目录名一致", fm.get("name") == name),
+        (f"引用文件齐全（{len(refs) - len(missing)}/{len(refs)}）", not missing),
+    ]
+
+
+def _installed_skills(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir() and (p / "SKILL.md").exists())
+
+
+def _list_installed(args) -> int:
+    target, root = skill_root(args.target)
+    if args.dir:
+        root = Path(args.dir)
+    skills = _installed_skills(root)
+    rows = []
+    for p in skills:
+        a = score_bundle(p)
+        rows.append({
+            "name": installed_name(p),
+            "path": str(p),
+            "score": a["score"],
+            "grade": a["grade"],
+            "issues": a["issues"][:3],
+        })
+    if args.json:
+        print(json.dumps({"root": str(root), "skills": rows}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"skills 根目录：{root}（{target}）")
+    if not rows:
+        print("  （空）")
+        return 0
+    for r in rows:
+        flag = "✓" if r["score"] >= 75 else "✗"
+        print(f"  {flag} {r['name']:<28} {r['score']:>3}/100 {r['grade']}")
+        if r["issues"]:
+            print(f"      · {r['issues'][0]}")
+    return 0
+
+
+def cmd_install(args) -> int:
+    if getattr(args, "list", False):
+        return _list_installed(args)
+    src = Path(args.skill_dir)
+    if not (src / "SKILL.md").exists():
+        raise SystemExit(f"不是 skill 包（缺 SKILL.md）：{src}")
+    name = installed_name(src)
+    target, root = skill_root(args.target)
+    if args.dir:
+        root = Path(args.dir)
+    dest = root / name
+    audit = score_bundle(src)
+    if args.uninstall:
+        if not dest.exists():
+            raise SystemExit(f"没有安装：{dest}")
+        if args.dry_run:
+            print(f"[dry-run] 将删除：{dest}")
+            return 0
+        shutil.rmtree(dest)
+        print(f"已卸载：{dest}")
+        return 0
+    if args.dry_run:
+        print(f"[dry-run] {src} → {dest}（体检 {audit['score']}/100，目标 {target}）")
+        return 0
+    if dest.exists() and not args.force:
+        raise SystemExit(f"已存在：{dest}（覆盖请加 --force）")
+    if audit["score"] < 60 and not args.force:
+        raise SystemExit(f"体检只有 {audit['score']}/100，先修好再加 --force 安装：\n  " +
+                         "\n  ".join(audit["issues"][:5]))
+    root.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pdf"))
+    checks = _verify_install(dest, name)
+    payload = {"target": target, "root": str(root), "path": str(dest), "name": name,
+               "score": audit["score"], "grade": audit["grade"],
+               "checks": [{"name": n, "ok": ok} for n, ok in checks]}
+    bad = [n for n, ok in checks if not ok]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"已安装：{dest}")
+        for n, ok in checks:
+            print(("  ✓ " if ok else "  ✗ ") + n)
+        print(f"  体检：{audit['score']}/100（{audit['grade']}）")
+        if target == "dsh":
+            print("  下一步：在 DSH 工作区里启用该技能（技能管理 ↵ 工作区技能开关）。")
+        else:
+            print("  下一步：下次启动 Claude Code 即可自动发现。")
+    return 0 if not bad else 1
+
+
 def cmd_build(args) -> int:
     src = load_source(args.source, args)
     profile = getattr(args, "profile", "dsh") or "dsh"
@@ -1178,7 +1311,58 @@ def cmd_fix(args) -> int:
     return 0 if audit["ok"] else 1
 
 
+def _lint_all(args) -> int:
+    roots = [Path(r) for r in (args.roots or [])]
+    if not roots:
+        for t in ("dsh", "claude"):
+            _, r = skill_root(t)
+            if r.exists():
+                roots.append(r)
+        if Path("skills").is_dir():
+            roots.append(Path("skills"))
+    if not roots:
+        print("没有找到任何 skills 根目录（用 --roots 指定，或先 skillforge install）。")
+        return 1
+    min_score = args.min if args.min else 75
+    rows: list[dict] = []
+    for root in roots:
+        for p in _installed_skills(root):
+            a = score_bundle(p)
+            fm = parse_frontmatter(read_text(p / "SKILL.md"))
+            rows.append({
+                "root": str(root),
+                "path": str(p),
+                "name": fm.get("name") or p.name,
+                "score": a["score"],
+                "grade": a["grade"],
+                "ok": a["ok"],
+                "issues": a["issues"][:3],
+            })
+    bad = [r for r in rows if r["score"] < min_score]
+    if args.json:
+        print(json.dumps({"roots": [str(r) for r in roots], "min": min_score,
+                          "total": len(rows), "below": len(bad), "skills": rows},
+                         ensure_ascii=False, indent=2))
+    else:
+        if not rows:
+            print(f"扫过 {len(roots)} 个根目录，没有找到 skill 包。")
+            return 1
+        print(f"共 {len(rows)} 个 skill（门禁 ≥{min_score}）")
+        for r in rows:
+            flag = "✓" if r["score"] >= min_score else "✗"
+            print(f"  {flag} {r['name']:<28} {r['score']:>3}/100 {r['grade']:<3} {r['path']}")
+            if r["score"] < min_score and r["issues"]:
+                print(f"      · {r['issues'][0]}")
+        print(f"结论：{len(rows) - len(bad)}/{len(rows)} 达标" +
+              (f"，{len(bad)} 个低于门禁" if bad else ""))
+    return 0 if not bad else 1
+
+
 def cmd_lint(args) -> int:
+    if getattr(args, "all", False):
+        return _lint_all(args)
+    if not args.skill_dir:
+        raise SystemExit("用法：skillforge lint <skill_dir>  或  skillforge lint --all [--roots ROOT ...]")
     d = Path(args.skill_dir)
     if not d.exists():
         raise SystemExit(f"目录不存在：{d}")
@@ -1261,6 +1445,8 @@ def main(argv=None) -> int:
                "  python skillforge.py build paper.pdf -o out/paper-skill --profile claude\n"
                "  python skillforge.py build ./my-repo -o out/x --dry-run\n"
                "  python skillforge.py lint out/my-skill\n"
+               "  python skillforge.py install out/my-skill          # 装到 DSH/Claude 的 skills 目录\n"
+               "  python skillforge.py lint --all                     # 批量体检已安装的 skill\n"
                "  python skillforge.py fix  out/my-skill\n"
                "  python skillforge.py diff out/my-skill\n",
     )
@@ -1278,9 +1464,22 @@ def main(argv=None) -> int:
     b.add_argument("--dry-run", action="store_true", help="只预演：打印将生成什么、预计得分，不写盘")
     b.add_argument("--json", action="store_true", help="额外输出机器可读 JSON")
 
-    l = sub.add_parser("lint", help="体检一个已有 skill 包")
-    l.add_argument("skill_dir")
+    l = sub.add_parser("lint", help="体检一个（或全部）已有 skill 包")
+    l.add_argument("skill_dir", nargs="?", help="skill 包目录（用了 --all 时可省略）")
+    l.add_argument("--all", action="store_true", help="扫描 skills 根目录下所有 skill")
+    l.add_argument("--roots", nargs="*", help="配合 --all：要扫描的根目录（默认 dsh/claude/./skills）")
+    l.add_argument("--min", type=int, default=0, help="配合 --all：低于该分数视为不达标（默认 75）")
     l.add_argument("--json", action="store_true")
+
+    ins = sub.add_parser("install", help="把生成的 skill 装到 DSH / Claude 的 skills 目录并回读校验")
+    ins.add_argument("skill_dir", nargs="?", help="skill 包目录（用了 --list 时可省略）")
+    ins.add_argument("--target", choices=SKILL_TARGETS, default="auto", help="目标运行时（默认 auto 探测）")
+    ins.add_argument("--dir", help="自定义 skills 根目录（覆盖 --target）")
+    ins.add_argument("--force", action="store_true", help="覆盖已安装的同名 skill / 低分也装")
+    ins.add_argument("--dry-run", action="store_true", help="只打印计划，不落盘")
+    ins.add_argument("--uninstall", action="store_true", help="卸载目标目录里的同名 skill")
+    ins.add_argument("--list", action="store_true", help="列出现已安装的 skill 及分数")
+    ins.add_argument("--json", action="store_true")
 
     fx = sub.add_parser("fix", help="自动修复机械问题（name/description/whenToUse/引用链接）")
     fx.add_argument("skill_dir")
@@ -1303,6 +1502,8 @@ def main(argv=None) -> int:
         return cmd_build(args)
     if args.cmd == "lint":
         return cmd_lint(args)
+    if args.cmd == "install":
+        return cmd_install(args)
     if args.cmd == "fix":
         return cmd_fix(args)
     if args.cmd == "diff":
