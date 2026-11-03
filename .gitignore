@@ -1,0 +1,22 @@
+# 生成物 / 临时产物
+out/
+*.zip
+report_*.txt
+_debug*.py
+.debug/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

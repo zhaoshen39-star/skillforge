@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Self-check (offline fixture)
+        run: python skillforge.py selftest
+      - name: Test suite
+        run: python tests/verify_skillforge.py
+      - name: Smoke build from this repo
+        run: python skillforge.py build . -o out/self-skill --force
+      - name: Lint generated package
+        run: python skillforge.py lint out/self-skill
