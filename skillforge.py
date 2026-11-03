@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -161,11 +162,22 @@ def strip_html(html: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 20) -> str:
+    """抓网页。部分 Windows Python 缺 CA 根证书，此时回退到「跳过校验」并放行一次。"""
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; skillforge/0.1; +https://github.com/)",
+        "User-Agent": "Mozilla/5.0 (compatible; skillforge/0.2; +https://github.com/)",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as e:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(e):
+            raise
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        print("提示：本机 Python 缺 CA 根证书，本次抓取已跳过证书校验。", file=sys.stderr)
+        r = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    with r:
         data = r.read()
         ctype = r.headers.get("Content-Type", "")
     if "charset=" in ctype:
@@ -483,6 +495,8 @@ scripts script src main index app server client tool tools test tests docs doc f
 male female sex date time hour minute second year month day longitude latitude
 references topics plain summary section sections field fields output outputs input inputs
 content contents value values data item items entry entries example output sample samples
+use using used uses without needing need needs avoid relying purposes permission service
+services testing monitoring documentation
 """.split())
 
 
@@ -498,18 +512,23 @@ def keywords(text: str, top: int = 12, lang: str = "en") -> list[str]:
     words = re.findall(r"[A-Za-z][A-Za-z0-9+#._-]{2,30}", plain)
     cjk = re.findall(r"[\u4e00-\u9fff]{2,6}", plain)
     cnt: Counter = Counter()
+    display: dict[str, str] = {}
     for w in words:
         lw = w.lower().strip("._-")
         if lw in STOPWORDS or lw in TECH_STOPWORDS or len(lw) < 3:
             continue
-        cnt[w] += 1
+        cnt[lw] += 1
+        # 同一词的大小写形态合并，优先保留首字母大写的写法（专名/类型名）
+        if lw not in display or (w[:1].isupper() and not display[lw][:1].isupper()):
+            display[lw] = w.strip("._-")
     for w in cjk:
         if w in STOPWORDS or w.startswith(CJK_STOP_PREFIX):
             continue
         if w.endswith(("的", "了", "是", "把", "在", "和", "与", "就", "都", "也", "着", "过", "吧")):
             continue
         cnt[w] += 3 if lang == "zh" else 1
-    return [w for w, _ in cnt.most_common(top)]
+        display.setdefault(w, w)
+    return [display.get(w, w) for w, _ in cnt.most_common(top)]
 
 
 def detect_language(src: Source) -> str:
@@ -1289,7 +1308,10 @@ def main(argv=None) -> int:
     if args.cmd == "diff":
         return cmd_diff(args)
     if args.cmd == "score":
-        a = score_bundle(Path(args.skill_dir))
+        d = Path(args.skill_dir)
+        if not (d / "SKILL.md").exists():
+            raise SystemExit(f"没有 SKILL.md：{d}")
+        a = score_bundle(d)
         if args.json:
             print(json.dumps(a, ensure_ascii=False, indent=2))
         else:
