@@ -77,7 +77,7 @@ dependency dependencies option options available
 SKIP_SECTION_TITLES = re.compile(
     r"^\s*(目录|contents|table of contents|toc|许可|license|licence|版权|"
     r"赞助|sponsor|致谢|acknowledg\w*|更新日志|changelog|版本|release|"
-    r"roadmap|规划|贡献|contribut\w*|star|trending)\s*$", re.I)
+    r"roadmap|规划|贡献|contribut\w*|star|trending|donate|donation|捐赠|打赏)\s*$", re.I)
 USEFUL_HEADING = re.compile(
     r"(安装|快速开始|开始|用法|使用|示例|上手|配置|参数|命令|api|接口|cli|"
     r"quick ?start|install|install(ing)?|usage|example|config|option|"
@@ -310,16 +310,42 @@ def extract_summary(src: Source, limit: int = 600) -> str:
     for title, body in sections:
         if SKIP_SECTION_TITLES.match(title) or is_toc_section(body):
             continue
-        for ln in body.splitlines():
-            para = clean_paragraph(ln, limit)
-            if para:
-                return para
-    # 兜底：README 最开头的正文行
-    for ln in src.readme.splitlines():
-        para = clean_paragraph(ln, limit)
+        para = first_paragraph(body, limit)
         if para:
             return para
+    # 兜底：README 里第一段像样的正文（跳过标题/HTML/代码块）
+    para = first_body_paragraph(src.readme, limit)
+    if para:
+        return para
     return one_line(src.manifest[:limit] if src.manifest else "", limit)
+
+
+def first_body_paragraph(md: str, limit: int) -> str:
+    """在整篇 markdown 里找第一段正文：跳过标题、HTML 块、徽章、代码块、表格。"""
+    buf: list[str] = []
+    in_fence = False
+    for ln in md.splitlines():
+        s = ln.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            if buf:
+                break
+            continue
+        if in_fence:
+            continue
+        if not s:
+            if buf:
+                break
+            continue
+        if BLOCK_START.match(s):
+            if buf:
+                break
+            continue
+        buf.append(s)
+        if sum(len(x) for x in buf) > limit:
+            break
+    text = clean_md(" ".join(buf).strip())
+    return one_line(text, limit) if len(text) >= 30 else ""
 
 
 def first_paragraph(body: str, limit: int) -> str:
@@ -338,8 +364,10 @@ def first_paragraph(body: str, limit: int) -> str:
             if buf:
                 break
             continue
-        if buf and BLOCK_START.match(s):
-            break
+        if BLOCK_START.match(s):
+            if buf:
+                break
+            continue
         buf.append(s)
         if sum(len(x) for x in buf) > limit:
             break
@@ -347,7 +375,7 @@ def first_paragraph(body: str, limit: int) -> str:
     return clean_md(one_line(text, limit)) if len(text) >= 12 else ""
 
 
-BLOCK_START = re.compile(r"^(#{1,6}\s|\||-\s|\*\s|\d+\.\s|```|!\[|\[[!\[]|>)")
+BLOCK_START = re.compile(r"^(#{1,6}\s|\||-\s|\*\s|\d+\.\s|```|!\[|\[[!\[]|<|>|\\)")
 CODEY = re.compile(
     r"(^|\s)(cat|curl|wget|git|pip|pip3|npm|yarn|pnpm|docker|cd|ls|rm|python|python3|bash|sh|node|go|cargo|make|sudo|echo|export)\b"
     r"|\|\s*[a-z][\w.-]*\s|--[a-z][\w-]+")
@@ -374,6 +402,8 @@ def clean_md(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = text.replace("**", "").replace("__", "")
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"<[^>]{1,400}>", "", text)  # 裸露 HTML / 徽章 / div 包装
+    text = re.sub(r"\s{2,}", " ", text)
     text = re.sub(r"^\s*(是|这是|它是|本项目|这个项目|该项目)\s*[：:]\s*", "", text)
     text = re.sub(r"^\s*[：:；;，,\-—]+\s*", "", text)
     return text.strip()
@@ -584,7 +614,10 @@ def build_frontmatter(name: str, description: str, when: list[str]) -> str:
 def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: dict) -> str:
     lang = detect_language(src)
     summary = extract_summary(src) or f"{src.title or name}（源材料：{src.label}）"
-    headings = " ".join(t for t, _ in extract_sections(src.readme)) if src.readme else ""
+    headings = " ".join(
+        t for t, body in extract_sections(src.readme)
+        if t and not SKIP_SECTION_TITLES.match(t) and not is_toc_section(body)
+    ) if src.readme else ""
     kws = keywords(summary + "\n" + (headings + "\n") * 3, 14, lang)
     if len(kws) < 4:
         kws = keywords((src.readme or "") + "\n" + (src.manifest or ""), 14, lang)
