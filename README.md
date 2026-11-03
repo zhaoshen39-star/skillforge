@@ -313,7 +313,7 @@ python skillforge.py diff out/my-skill                    # 源变了就退出�
 - [x] `lint --all` — audit a whole skills library, CI-friendly exit code
 - [x] `scan` — prompt-injection / dangerous-command / leaked-secret scanner for generated skills
 - [x] extract runnable commands from README quick starts (prompts and install logs stripped)
-- [ ] multi-page docs index (numbered `docs/` references with a reading order)
+- [x] multi-page docs index — `## 参考文件` lists a reading order when there are 2+ docs
 - [ ] `--from-tests` — derive `whenToUse` from example user queries
 - [ ] PDF layout handling beyond text extraction (`pypdf` optional)
 - [ ] `build --watch` — regenerate on source change
@@ -321,7 +321,7 @@ python skillforge.py diff out/my-skill                    # 源变了就退出�
 ## Tests
 
 ```bash
-python tests/verify_skillforge.py    # 102 checks, offline, no network
+python tests/verify_skillforge.py    # 104 checks, offline, no network
 python skillforge.py selftest        # 11 built-in checks on a fixture repo
 ```
 

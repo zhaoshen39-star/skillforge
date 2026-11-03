@@ -402,6 +402,18 @@ def main() -> int:
         block = norm[idx:].split("```")[1] if idx >= 0 and "```" in norm[idx:] else ""
         check("Successfully installed" not in block and "Collecting" not in block,
               "V3 安装日志行不混进提炼命令")
+        # W. 多页文档索引：>=2 份 docs 生成阅读顺序
+        multi = tmp / "multi-docs"
+        (multi / "docs").mkdir(parents=True)
+        (multi / "README.md").write_text("# multi\n\n**Multi doc tool.**\n\n## Usage\n\n```bash\nmulti run\n```\n",
+                                          encoding="utf-8")
+        (multi / "docs" / "01-setup.md").write_text("# Setup\n\nInstall steps.\n", encoding="utf-8")
+        (multi / "docs" / "02-advanced.md").write_text("# Advanced\n\nTuning.\n", encoding="utf-8")
+        out_multi = tmp / "out-multi"
+        p = run("build", str(multi), "-o", str(out_multi))
+        mskill = (out_multi / "SKILL.md").read_text(encoding="utf-8")
+        check("多页文档按这个顺序读" in mskill, "W1 多份 docs 生成阅读顺序")
+        check(mskill.index("01-setup") < mskill.index("02-advanced"), "W2 阅读顺序按文件名排序")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

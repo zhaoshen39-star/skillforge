@@ -17,6 +17,8 @@ blocks are full of noise. This release adds a scanner and a cleaner command extr
   and prints a one-line verdict. `--strict-risk` aborts **before writing** (exit `2`).
 - `lint` reports risks and fails a 100-point bundle that contains a high-severity
   finding — structure score alone is not a health guarantee.
+- Multi-page docs index: when a bundle has two or more markdown references, the
+  `## 参考文件` section prints an explicit reading order (`01-… -> 02-…`).
 - `extract_commands()` — pulls runnable commands out of README shell blocks, strips
   `$`/`>` prompts, comments, install logs ("Collecting…", "Successfully installed…")
   and prose; the generated quick start now leads with these instead of raw blocks.

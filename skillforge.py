@@ -891,6 +891,14 @@ def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: d
             hint = first_heading(content) or one_line(content, 80)
             out.append(f"- `references/{rel}` — {hint}")
         out.append("")
+        doc_refs = [r for r, _ in refs
+                    if r.lower().endswith((".md", ".markdown", ".rst", ".txt")) and r != "README.md"]
+        if len(doc_refs) >= 2:
+            order = " → ".join(f"`{r}`" for r in doc_refs[:8])
+            if len(doc_refs) > 8:
+                order += f" …（共 {len(doc_refs)} 份）"
+            out.append("多页文档按这个顺序读：" + order)
+            out.append("")
         out.append("读哪份：先读 `README.md`；需要细节时按上面提示跳转；不要一次性全读，按问题取用。")
         out.append("")
 
