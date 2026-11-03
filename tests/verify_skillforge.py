@@ -271,7 +271,7 @@ def main() -> int:
 
         # Q. meta 记录升级
         raw = json.loads((out / "meta.json").read_text(encoding="utf-8"))
-        check(raw.get("version") == "0.4.0", "Q1 meta.version 为 0.4.0")
+        check(raw.get("version") == "0.5.0", "Q1 meta.version 为 0.5.0")
         check(raw.get("profile") == "dsh", "Q2 meta.profile 默认为 dsh")
         check(len(raw.get("source_files", [])) >= 3, "Q3 meta 记录源文件哈希")
         check(bool(raw.get("source_root")), "Q4 meta 记录 source_root")
@@ -414,6 +414,88 @@ def main() -> int:
         mskill = (out_multi / "SKILL.md").read_text(encoding="utf-8")
         check("多页文档按这个顺序读" in mskill, "W1 多份 docs 生成阅读顺序")
         check(mskill.index("01-setup") < mskill.index("02-advanced"), "W2 阅读顺序按文件名排序")
+        # X. --from-tests：示例问句进 whenToUse（用户原话优先于推测）
+        qfile = tmp / "queries.txt"
+        qfile.write_text(
+            "帮我把这个仓库变成 skill\n"
+            "- 生成的 skill 为什么装不上？\n"
+            "how do I score a skill bundle?\n"
+            "\n"
+            "no\n",
+            encoding="utf-8",
+        )
+        out_q = tmp / "out-queries"
+        p = run("build", str(demo), "-o", str(out_q), "--from-tests", str(qfile))
+        check(p.returncode == 0, "X1 --from-tests 构建成功")
+        qskill = (out_q / "SKILL.md").read_text(encoding="utf-8")
+        check("用户问「帮我把这个仓库变成 skill」这类问题时" in qskill, "X2 中文示例问句进 whenToUse")
+        check('When the user asks something like "how do I score a skill bundle?"' in qskill,
+              "X3 英文示例问句进 whenToUse")
+        check("生成的 skill 为什么装不上" in qskill, "X4 列表符号被剥掉")
+        qmeta = json.loads((out_q / "meta.json").read_text(encoding="utf-8"))
+        check(bool(qmeta.get("from_tests")), "X5 meta 记录 from_tests 来源")
+        qdir = tmp / "qdir"
+        qdir.mkdir()
+        (qdir / "extra.md").write_text("怎么给已有 skill 补 whenToUse？\n", encoding="utf-8")
+        out_q2 = tmp / "out-queries2"
+        p = run("build", str(demo), "-o", str(out_q2), "--from-tests", str(qdir))
+        check(p.returncode == 0 and "怎么给已有 skill 补 whenToUse"
+              in (out_q2 / "SKILL.md").read_text(encoding="utf-8"), "X6 目录形式的示例问句")
+        p = run("build", str(demo), "-o", str(tmp / "out-q3"), "--from-tests", str(tmp / "nope.txt"))
+        check(p.returncode != 0 and "--from-tests 路径不存在" in (p.stdout + p.stderr),
+              "X7 示例问句路径不存在时报错")
+
+        # Y. --watch 用的源指纹（不真跑无限循环）
+        sys.path.insert(0, str(ROOT))
+        import skillforge as sf  # noqa: E402
+        sig1 = sf._source_signature(str(demo))
+        check(sf._source_signature(str(demo)) == sig1, "Y1 源没变时指纹稳定")
+        (demo / "README.md").write_text(DEMO_README + "\n## FAQ\n\nAdded.\n", encoding="utf-8")
+        check(sf._source_signature(str(demo)) != sig1, "Y2 源改动后指纹变化")
+        check(sf._source_signature(str(demo / "README.md"))[0] == "file", "Y3 单文件源指纹")
+        check(sf._source_signature(str(tmp / "missing"))[0] == "remote", "Y4 未知源不抛异常")
+        check("--watch" in run("build", "--help").stdout, "Y5 --help 里有 --watch")
+
+        # Z. PDF 降级路径与版面清理
+        bad_pdf = tmp / "paper.pdf"
+        bad_pdf.write_bytes(b"%PDF-1.4\n% not a real pdf\n")
+        # Z1：没有 pypdf / pdftotext 时必须说清楚装什么（用假 import 模拟缺依赖，与本机是否安装无关）
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _no_pypdf(name, *a, **k):
+            if name == "pypdf":
+                raise ImportError("blocked for test")
+            return real_import(name, *a, **k)
+
+        real_which = shutil.which
+        builtins.__import__ = _no_pypdf
+        shutil.which = lambda *a, **k: None  # 连系统 pdftotext 也当作没有
+        try:
+            try:
+                sf.pdf_text(bad_pdf)
+                pdf_err = ""
+            except SystemExit as e:
+                pdf_err = str(e)
+        finally:
+            builtins.__import__ = real_import
+            shutil.which = real_which
+        check("pypdf" in pdf_err and "pdftotext" in pdf_err,
+              "Z1 缺少 PDF 依赖时给出可操作报错")
+        # Z1b：坏 PDF 必须非零退出并提到 PDF，而不是静默生成空 skill
+        p = run("build", str(bad_pdf), "-o", str(tmp / "out-pdf"))
+        zout = p.stdout + p.stderr
+        check(p.returncode != 0 and any(k in zout for k in ("PDF", "pypdf", "pdftotext")),
+              "Z1b 坏 PDF 明确报错")
+        pages = [["报告标题", "第一段正文", "第 1 页"],
+                 ["报告标题", "第二段正文", "第 2 页"],
+                 ["报告标题", "第三段正文", "第 3 页"]]
+        cleaned = sf._strip_repeated_lines([list(x) for x in pages])
+        check(all("报告标题" not in page for page in cleaned), "Z2 去掉重复页眉")
+        check(sf._pdf_lines("hello   world\n\nnext\tline") == ["hello world", "", "next line"],
+              "Z3 PDF 行内空白归一")
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

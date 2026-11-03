@@ -33,6 +33,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -44,7 +45,7 @@ try:  # 让 Windows 控制台也能输出中文/✓
 except Exception:
     pass
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # skill 运行时的 frontmatter 习惯不同：
 #   dsh     — name / description / whenToUse（DSH 会读 whenToUse 做路由）
@@ -265,21 +266,84 @@ def load_single_file(path: Path) -> Source:
     ext = path.suffix.lower()
     rel = path.name
     src.add_file(rel, text)
-    if ext in DOC_EXTS or rel.lower().startswith("readme"):
+    if ext in DOC_EXTS or rel.lower().startswith("readme") or ext == ".pdf":
         src.readme = text
     src.title = path.stem
+    if ext == ".pdf":
+        # PDF 没有标题层级：拿第一段像正文的文字当标题，别让摘要变成整条路径
+        for line in text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("[第 ") and len(s) >= 4:
+                src.title = one_line(s, 80)
+                break
     return src
 
 
+def _pdf_lines(text: str) -> list[str]:
+    """按行切分并压掉行内多余空白；空行保留（段落边界靠它）。"""
+    out: list[str] = []
+    for line in (text or "").replace("\r", "\n").split("\n"):
+        line = line.rstrip()
+        out.append(re.sub(r"[ \t]+", " ", line) if line.strip() else "")
+    return out
+
+
+def _strip_repeated_lines(pages: list[list[str]]) -> list[list[str]]:
+    """去掉每页都出现的页眉/页脚（按去空白后的行文本比对，至少 3 页才判断）。"""
+    if len(pages) < 3:
+        return pages
+    counts: Counter = Counter()
+    for lines in pages:
+        for line in {l.strip() for l in lines if l.strip()}:
+            counts[line] += 1
+    threshold = max(3, int(len(pages) * 0.6))
+    repeated = {t for t, n in counts.items() if n >= threshold and len(t) <= 80}
+    if not repeated:
+        return pages
+    return [[l for l in lines if l.strip() not in repeated] for lines in pages]
+
+
 def pdf_text(path: Path) -> str:
+    """读 PDF 正文（无第三方依赖时尽量降级）。
+
+    PDF 没有标题层级，能做的是版面层面的清理：按页分段、去重复页眉页脚、拼回被断词连字符切开的单词。
+    优先用 pypdf；没装就试系统 pdftotext；都没有时给可操作的报错而不是静默返回空。
+    """
+    pypdf = None
     try:
-        import pypdf  # type: ignore
-        reader = pypdf.PdfReader(str(path))
-        return "\n\n".join((pg.extract_text() or "") for pg in reader.pages)
+        import pypdf  # type: ignore # noqa: F811
     except ImportError:
-        raise SystemExit("读取 PDF 需要可选依赖：pip install pypdf（或先导出为 md/txt 再喂给 skillforge）")
-    except Exception as e:  # 损坏/加密 PDF
-        raise SystemExit(f"读取 PDF 失败：{e}")
+        pypdf = None  # type: ignore[assignment]
+
+    if pypdf is not None:
+        try:
+            reader = pypdf.PdfReader(str(path))
+            raw_pages = [(pg.extract_text() or "") for pg in reader.pages]
+        except Exception as e:  # 损坏/加密 PDF
+            raise SystemExit(f"读取 PDF 失败：{e}")
+        pages = _strip_repeated_lines([_pdf_lines(p) for p in raw_pages])
+        chunks: list[str] = []
+        for i, lines in enumerate(pages, 1):
+            body = "\n".join(lines).strip()
+            if body:
+                chunks.append(f"[第 {i} 页]\n{body}")
+        text = "\n\n".join(chunks)
+    else:
+        exe = shutil.which("pdftotext") or shutil.which("pdftotext.exe")
+        if not exe:
+            raise SystemExit(
+                "读取 PDF 需要可选依赖：pip install pypdf"
+                "（或安装 poppler 的 pdftotext；也可以先把 PDF 导出成 md/txt 再喂给 skillforge）"
+            )
+        r = subprocess.run([exe, "-layout", "-enc", "UTF-8", str(path), "-"],
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise SystemExit(f"pdftotext 读取失败：{(r.stderr or '').strip()[:400]}")
+        text = r.stdout
+
+    # 拼回被换行拆开的词：exam-\nple -> example
+    text = re.sub(r"([A-Za-z])-\n([a-z])", r"\1\2", text)
+    return text
 
 
 def load_git(url: str) -> Source:
@@ -446,6 +510,7 @@ def clean_md(text: str) -> str:
     text = text.replace("**", "").replace("__", "")
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"<[^>]{1,400}>", "", text)  # 裸露 HTML / 徽章 / div 包装
+    text = re.sub(r"\[第\s*\d+\s*页\]", "", text)  # PDF 页码标记不进摘要
     text = re.sub(r"\s{2,}", " ", text)
     text = re.sub(r"^\s*(是|这是|它是|本项目|这个项目|该项目)\s*[：:]\s*", "", text)
     text = re.sub(r"^\s*[：:；;，,\-—]+\s*", "", text)
@@ -541,6 +606,55 @@ def extract_commands(md: str, max_cmds: int = 8) -> list[str]:
             if len(out) >= max_cmds:
                 return out
     return out
+
+
+def load_example_queries(*paths: str, limit: int = 12) -> list[str]:
+    """读示例问句：一行一句，可以是 .txt/.md 文件或目录（递归找文档）。
+
+    这些是「用户原话」，比从标题推测的触发条件可靠，所以优先写进 whenToUse。
+    """
+    queries: list[str] = []
+    for raw in paths:
+        if not raw:
+            continue
+        p = Path(raw)
+        if p.is_dir():
+            files = sorted(x for x in p.rglob("*")
+                           if x.is_file() and x.suffix.lower() in (".txt", ".md", ".markdown", ".text"))
+        elif p.is_file():
+            files = [p]
+        else:
+            raise SystemExit(f"--from-tests 路径不存在：{raw}")
+        for f in files:
+            for line in read_text(f).splitlines():
+                q = line.strip()
+                q = re.sub(r"^(?:[-*+•]|\d+[.)、])\s*", "", q)  # 列表符号
+                q = q.strip("`\"'“”「」 ")
+                if not q or q.startswith("#") or not (4 <= len(q) <= 160):
+                    continue
+                if q not in queries:
+                    queries.append(q)
+                if len(queries) >= limit:
+                    return queries
+    return queries
+
+
+def merge_triggers(examples: list[str], inferred: list[str], lang: str = "zh",
+                   limit: int = 10) -> list[str]:
+    """示例问句（用户原话）排在自动推测的触发条件前面。"""
+    out: list[str] = []
+    for q in examples:
+        # 逐句判断语言：中文问句配中文模板（与文档语言无关），其余配英文模板
+        if re.search(r"[\u4e00-\u9fff]", q):
+            item = f"用户问「{q}」这类问题时"
+        else:
+            item = f'When the user asks something like "{q}".'
+        if item not in out:
+            out.append(item)
+    for item in inferred:
+        if item not in out:
+            out.append(item)
+    return out[:limit]
 
 
 RISK_RULES: list[tuple[str, str, re.Pattern]] = [
@@ -798,7 +912,7 @@ def build_frontmatter(name: str, description: str, when: list[str], profile: str
 
 
 def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: dict,
-                   profile: str = "dsh") -> str:
+                   profile: str = "dsh", extra_triggers: list[str] | None = None) -> str:
     lang = detect_language(src)
     summary = extract_summary(src) or f"{src.title or name}（源材料：{src.label}）"
     headings = " ".join(
@@ -809,6 +923,8 @@ def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: d
     if len(kws) < 4:
         kws = keywords((src.readme or "") + "\n" + (src.manifest or ""), 14, lang)
     triggers = guess_triggers(src, kws, lang)
+    if extra_triggers:
+        triggers = merge_triggers(extra_triggers, triggers, lang)
     code = extract_code_blocks(src.readme, 3)
     core = useful_sections(src.readme)
 
@@ -1205,6 +1321,53 @@ def cmd_install(args) -> int:
     return 0 if not bad else 1
 
 
+def _source_signature(path: str) -> tuple:
+    """给源材料算个轻量指纹：文件集合 + 每个文件的内容哈希。"""
+    p = Path(path)
+    if p.is_dir():
+        files = iter_text_files(p)
+        h = hashlib.sha256()
+        for f in sorted(files):
+            rel = f.relative_to(p).as_posix()
+            h.update(rel.encode("utf-8", "replace"))
+            h.update(sha256_text(read_text(f)).encode())
+        return ("dir", len(files), h.hexdigest())
+    if p.is_file():
+        text = read_text(p)
+        return ("file", len(text), sha256_text(text))
+    return ("remote", path)
+
+
+def _watch_build(args) -> int:  # pragma: no cover - 交互循环
+    """--watch：源材料一改就重跑 build，直到 Ctrl-C。"""
+    interval = max(0.5, float(args.watch or 2.0))
+    target = args.output or (slugify(args.name) if args.name else "(自动命名)")
+    print(f"监听 {args.source} → {target}（每 {interval:g}s 检查一次，Ctrl-C 退出）", flush=True)
+    # watch 模式下输出目录就是自己上一次的产物，重复生成时自动覆盖（等同 --force）
+    args.watch_force = True
+    last = None
+    first = True
+    try:
+        while True:
+            sig = _source_signature(args.source)
+            if first or sig != last:
+                if not first:
+                    print("\n— 检测到改动，重新生成 —", flush=True)
+                print(f"[{time.strftime('%H:%M:%S')}] build {args.source} → {target}", flush=True)
+                try:
+                    rc = cmd_build(args)
+                except SystemExit as e:  # build 的校验错误不应中断监听
+                    print(f"build 中止：{e}", flush=True)
+                    rc = 1
+                print(f"[{time.strftime('%H:%M:%S')}] 退出码 {rc}，继续监听…", flush=True)
+                last = sig
+                first = False
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n已停止监听。", flush=True)
+        return 0
+
+
 def cmd_build(args) -> int:
     src = load_source(args.source, args)
     profile = getattr(args, "profile", "dsh") or "dsh"
@@ -1217,7 +1380,10 @@ def cmd_build(args) -> int:
     if len(refs) <= 1:
         gaps.append("可抽取的文档很少，建议把长文档放在 references/ 后重跑。")
     audit = {"gaps": gaps}
-    skill_md = build_skill_md(src, name, refs, audit, profile)
+    extra_triggers: list[str] = []
+    for tpath in getattr(args, "from_tests", None) or []:
+        extra_triggers.extend(load_example_queries(tpath))
+    skill_md = build_skill_md(src, name, refs, audit, profile, extra_triggers)
     risks = scan_risks(skill_md, "SKILL.md")
     for rel, content in refs:
         risks.extend(scan_risks(content, "references/" + rel))
@@ -1248,6 +1414,7 @@ def cmd_build(args) -> int:
         "chars_total": sum(len(c) for _, c in refs),
         "gaps": gaps,
         "risks": risks[:20],
+        "from_tests": list(getattr(args, "from_tests", None) or []),
         "commands": [f"python skillforge.py build {args.source} -o {out.as_posix()}"
                      + (f" --name {name}" if args.name else "")
                      + (f" --profile {profile}" if profile != "dsh" else "")],
@@ -1276,10 +1443,11 @@ def cmd_build(args) -> int:
         print("  去掉 --dry-run 即写入。")
         return 0 if audit["ok"] else 3
 
+    force = bool(getattr(args, "force", False) or getattr(args, "watch_force", False))
     if out.exists():
-        if not args.force and any(out.iterdir()):
+        if not force and any(out.iterdir()):
             raise SystemExit(f"输出目录已存在且非空：{out}（加 --force 覆盖，或用 -o 换目录）")
-        if args.force:
+        if force:
             shutil.rmtree(out)
     _write_bundle(out, skill_md, refs, meta)
     audit = score_bundle(out)
@@ -1647,6 +1815,10 @@ def main(argv=None) -> int:
     b.add_argument("--force", action="store_true", help="输出目录已存在时覆盖")
     b.add_argument("--dry-run", action="store_true", help="只预演：打印将生成什么、预计得分，不写盘")
     b.add_argument("--strict-risk", action="store_true", help="风险扫描命中高风险时中止，不写盘（退出码 2）")
+    b.add_argument("--from-tests", action="append", default=None, metavar="PATH",
+                   help="从示例问句生成 whenToUse（每行一句，.txt/.md 文件或目录；可重复）")
+    b.add_argument("--watch", nargs="?", const=2.0, type=float, default=None, metavar="SEC",
+                   help="监听源材料，改动后自动重新 build（默认 2 秒检查一次，Ctrl-C 退出）")
     b.add_argument("--json", action="store_true", help="额外输出机器可读 JSON")
 
     l = sub.add_parser("lint", help="体检一个（或全部）已有 skill 包")
@@ -1689,6 +1861,8 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     if args.cmd == "build":
+        if getattr(args, "watch", None) is not None:
+            return _watch_build(args)
         return cmd_build(args)
     if args.cmd == "lint":
         return cmd_lint(args)

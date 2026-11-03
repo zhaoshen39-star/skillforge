@@ -3,6 +3,28 @@
 All notable changes to skillforge are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: semver.
 
+## [0.5.0] — 2026-11-03
+
+Trigger routing was still guessed from headings, and iterating on the source meant
+running `build` by hand every time. This release takes routing from real questions
+and turns generation into a save-and-see loop.
+
+### Added
+- `build --from-tests PATH` — reads example user questions (one per line; a file or a
+  directory of `.md`/`.txt`, repeatable) and writes them **first** in `whenToUse`.
+  Chinese questions get a Chinese template, the rest an English one; the source paths
+  are recorded in `meta.json.from_tests`.
+- `build --watch [SEC]` — fingerprints the source (file list + per-file hash), rebuilds
+  on change (default every 2 s), keeps the output directory in sync, Ctrl-C to stop.
+  A failing rebuild does not kill the loop.
+- PDF layout cleanup: `[第 N 页]` page markers, repeated header/footer removal
+  (≥60% of pages, ≥3 pages), hyphenated word rejoin; falls back to system
+  `pdftotext -layout` when `pypdf` is absent, and says what to install when neither exists.
+
+### Fixed
+- `build` into an existing output directory in watch mode no longer fails with
+  "directory not empty" — watch owns its output and overwrites it.
+
 ## [0.4.0] — 2026-11-03
 
 Skills assembled from untrusted text are an injection vector, and quick-start code

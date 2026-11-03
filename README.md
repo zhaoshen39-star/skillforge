@@ -59,6 +59,13 @@ python skillforge.py install out/my-skill --target claude   # → ~/.claude/skil
 python skillforge.py diff out/my-skill
 ```
 
+`--from-tests` writes routing triggers from real questions, and `--watch` regenerates while you edit the source:
+
+```bash
+python skillforge.py build ./my-repo -o out/my-skill --from-tests questions.txt
+python skillforge.py build ./docs -o out/docs-skill --watch 1     # rebuild on every save, Ctrl-C to stop
+```
+
 ```
 已生成：out/my-skill
   SKILL.md     1181 字符    profile=dsh
@@ -76,6 +83,58 @@ python skillforge.py build ./my-repo -o out/skill --profile generic
 ```
 
 `--dry-run` shows exactly what would be generated and what it would score, without writing anything.
+
+## Write triggers from real questions: `--from-tests`
+
+The weakest part of any generated skill is `whenToUse`: it is guessed from headings. If you
+already know how people ask, hand the questions over — one per line, and they go **first**,
+ahead of the guesses:
+
+```bash
+cat questions.txt
+帮我把这个仓库变成 skill
+生成的 skill 为什么装不上？
+how do I score a skill bundle?
+
+python skillforge.py build ./my-repo -o out/my-skill --from-tests questions.txt
+```
+
+```yaml
+whenToUse: |
+  - 用户问「帮我把这个仓库变成 skill」这类问题时
+  - 用户问「生成的 skill 为什么装不上？」这类问题时
+  - When the user asks something like "how do I score a skill bundle?".
+  - When the user asks about "Install".
+```
+
+`--from-tests` accepts a file or a directory (any `.md` / `.txt` inside), can be repeated, and the
+sources are recorded in `meta.json` so a later `diff` run knows where they came from.
+
+## Regenerate while you write: `build --watch`
+
+Building a skill is something you do while the source is still moving. `--watch` fingerprints the
+source (file list + per-file hash), rebuilds on change, and keeps the output directory in sync:
+
+```bash
+$ python skillforge.py build ./docs -o out/docs-skill --watch 1
+监听 ./docs → out/docs-skill（每 1s 检查一次，Ctrl-C 退出）
+[16:12:58] build ./docs → out/docs-skill
+已生成：out/docs-skill … 体检：100/100（A）
+[16:12:59] 退出码 0，继续监听…
+
+— 检测到改动，重新生成 —
+[16:13:01] build ./docs → out/docs-skill
+```
+
+In watch mode the output directory belongs to the previous build, so it is overwritten automatically
+(equivalent to `--force` for that directory only).
+
+### PDF input
+
+`.pdf` works through `pypdf` when it is installed: pages are split into `[第 N 页]` markers,
+repeated headers/footers are dropped, and words broken by a hyphen at a line end are rejoined.
+Without `pypdf` it falls back to a system `pdftotext`, and if neither exists it says exactly
+what to install instead of producing an empty skill.
 
 ## Install it (the part everyone forgets)
 
@@ -268,7 +327,8 @@ Exit codes are CI-friendly: `0` healthy, `1` unhealthy.
 
 ```
 python skillforge.py build  <source> [-o OUT] [--name NAME] [--profile dsh|claude|generic]
-                                      [--budget N] [--force] [--dry-run] [--strict-risk] [--json]
+                                      [--budget N] [--force] [--dry-run] [--strict-risk]
+                                      [--from-tests PATH] [--watch [SEC]] [--json]
 python skillforge.py lint   <skill-dir> [--json]
 python skillforge.py lint   --all [--roots ROOT ...] [--min 75] [--json]
 python skillforge.py install <skill-dir> [--target auto|dsh|claude] [--dir PATH]
@@ -291,6 +351,7 @@ python skillforge.py --version
 - 纯标准库，零第三方依赖
 - 六条命令形成闭环：`build` 生成 → `lint` 体检（可 `--all` 批量）→ `fix` 修机械问题 → `install` 装进 DSH/Claude 并回读校验 → `diff` 查过期 → `score` 做 CI 门禁
 - 不编造事实：源材料没写的，就列进「待补充」；`fix` 只改结构不改内容
+- `--from-tests` 用真实问句写 `whenToUse`；`--watch` 改源文件就自动重建；PDF 支持按页切分、去重复页眉页脚
 
 ```bash
 python skillforge.py build ./my-repo -o out/my-skill --profile dsh
@@ -299,6 +360,8 @@ python skillforge.py fix  out/my-skill
 python skillforge.py install out/my-skill                 # 直接装进 $DSH_HOME/skills
 python skillforge.py lint --all ~/.dsh/skills             # 批量体检
 python skillforge.py diff out/my-skill                    # 源变了就退出码 1
+python skillforge.py build ./repo -o out/x --from-tests questions.txt   # 用真实问句写触发条件
+python skillforge.py build ./docs -o out/d --watch 1      # 改一下就重建
 ```
 
 生成出来的 `SKILL.md` 是固定骨架：是什么/什么时候用 → 核心内容 → 快速开始 → 关键概念 → 参考文件 → 待补充 → 维护。
@@ -314,14 +377,15 @@ python skillforge.py diff out/my-skill                    # 源变了就退出�
 - [x] `scan` — prompt-injection / dangerous-command / leaked-secret scanner for generated skills
 - [x] extract runnable commands from README quick starts (prompts and install logs stripped)
 - [x] multi-page docs index — `## 参考文件` lists a reading order when there are 2+ docs
-- [ ] `--from-tests` — derive `whenToUse` from example user queries
-- [ ] PDF layout handling beyond text extraction (`pypdf` optional)
-- [ ] `build --watch` — regenerate on source change
+- [x] `--from-tests` — derive `whenToUse` from example user queries
+- [x] `build --watch` — regenerate on source change
+- [x] PDF layout handling — page markers, repeated header/footer removal, hyphen rejoin (`pypdf` optional)
+- [ ] `--from-git-history` — derive whenToUse from real commit/issue text
 
 ## Tests
 
 ```bash
-python tests/verify_skillforge.py    # 104 checks, offline, no network
+python tests/verify_skillforge.py    # 119 checks, offline, no network
 python skillforge.py selftest        # 11 built-in checks on a fixture repo
 ```
 

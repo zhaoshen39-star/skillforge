@@ -52,3 +52,9 @@ jobs:
       - name: Install + lint --all round-trip
         run: |
           python -c "import subprocess,sys,tempfile,pathlib; d=tempfile.mkdtemp(); run=lambda a: subprocess.run([sys.executable,'skillforge.py']+a).returncode; ok = run(['install','out/self-skill','--dir',d])==0 and (pathlib.Path(d)/'skillforge'/'SKILL.md').exists() and run(['install','--list','--dir',d,'--json'])==0 and run(['lint','--all','--roots',d,'--min','90'])==0 and run(['install','out/self-skill','--dir',d,'--uninstall'])==0; print('install round-trip:', 'ok' if ok else 'FAILED'); sys.exit(0 if ok else 1)"
+
+      - name: Triggers from example questions
+        run: |
+          python -c "import pathlib; pathlib.Path('questions.txt').write_text('how do I score a skill bundle?\n', encoding='utf-8')"
+          python skillforge.py build examples/demo-repo -o out/q-skill --from-tests questions.txt --force
+          python -c "import pathlib,sys; t=pathlib.Path('out/q-skill/SKILL.md').read_text(encoding='utf-8'); ok='how do I score a skill bundle?' in t; print('trigger wired:', ok); sys.exit(0 if ok else 1)"
