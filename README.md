@@ -385,7 +385,7 @@ python skillforge.py build ./docs -o out/d --watch 1      # 改一下就重建
 ## Tests
 
 ```bash
-python tests/verify_skillforge.py    # 119 checks, offline, no network
+python tests/verify_skillforge.py    # 120 checks, offline, no network
 python skillforge.py selftest        # 11 built-in checks on a fixture repo
 ```
 
