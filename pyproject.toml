@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillforge"
-version = "0.2.0"
+version = "0.4.0"
 description = "Turn any repo, doc, or PDF into an auditable agent skill — generate, lint, fix, and detect drift. Zero dependencies."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "薛兆珅" }]
-keywords = ["agent-skills", "skill", "llm", "cli", "lint", "audit", "deterministic"]
+keywords = ["agent-skills", "skill", "llm", "cli", "lint", "audit", "deterministic", "security", "prompt-injection"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",

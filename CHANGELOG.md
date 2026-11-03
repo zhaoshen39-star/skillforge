@@ -3,6 +3,31 @@
 All notable changes to skillforge are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: semver.
 
+## [0.4.0] — 2026-11-03
+
+Skills assembled from untrusted text are an injection vector, and quick-start code
+blocks are full of noise. This release adds a scanner and a cleaner command extractor.
+
+### Added
+- `scan <path>` — static scan of a bundle (or single file) for prompt injection
+  (English + Chinese), pipe-to-shell installers, destructive commands, leaked
+  credentials (`sk-…`, `ghp_…`, `AKIA…`), invisible Unicode, and HTML comments that
+  hide instructions. Exit `1` on high severity; `--lenient` to inspect only; `--json`.
+- `build` now scans what it is about to write, records findings in `meta.json.risks`,
+  and prints a one-line verdict. `--strict-risk` aborts **before writing** (exit `2`).
+- `lint` reports risks and fails a 100-point bundle that contains a high-severity
+  finding — structure score alone is not a health guarantee.
+- `extract_commands()` — pulls runnable commands out of README shell blocks, strips
+  `$`/`>` prompts, comments, install logs ("Collecting…", "Successfully installed…")
+  and prose; the generated quick start now leads with these instead of raw blocks.
+
+### Changed
+- Quick start section keeps the original blocks as "原文示例" for fidelity, but the
+  first fence is the cleaned command list.
+
+### Fixed
+- `_looks_like_command()` guards against flag-like log lines being promoted to commands.
+
 ## [0.3.0] — 2026-11-03
 
 Generating a skill is useless if the runtime never finds it, or if you have thirty

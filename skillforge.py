@@ -44,7 +44,7 @@ try:  # 让 Windows 控制台也能输出中文/✓
 except Exception:
     pass
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # skill 运行时的 frontmatter 习惯不同：
 #   dsh     — name / description / whenToUse（DSH 会读 whenToUse 做路由）
@@ -470,6 +470,131 @@ def extract_code_blocks(md: str, max_blocks: int = 4) -> list[str]:
     return out
 
 
+SHELL_LANGS = {"", "bash", "sh", "shell", "console", "zsh", "pwsh", "powershell", "cmd", "bat", "shell-session", "terminal"}
+KNOWN_CMDS = set("""
+git pip pip3 pipx npm npx yarn pnpm bun deno python python3 py node cargo rustc go docker podman
+make cmake ninja curl wget brew apt apt-get dnf yum pacman choco scoop winget dotnet java mvn gradle
+ruby gem bundle php composer uv poetry conda mamba ollama kubectl helm terraform ansible ssh scp rsync
+tar unzip chmod mkdir cd export source bash sh pwsh powershell psql mysql redis-cli sqlite3 jq rg grep
+sed awk cat ls cp mv rm touch echo
+""".split())
+# 安装/构建日志里常见的「假命令」行
+NOISE_LINE = re.compile(
+    r"(?i)^(collecting|downloading|installing|successfully|requirement|using cached|building wheel|"
+    r"created |removed |added |up to date|found \d|warning|error:|note:|done\b|=> |➜ |✓|✔|✗|✘|"
+    r"npm (warn|notice|http)|yarn |pnpm )")
+
+
+def _looks_like_command(cmd: str) -> bool:
+    toks = cmd.split()
+    if not toks:
+        return False
+    head = toks[0]
+    if head in {"$", ">"}:
+        toks = toks[1:]
+        if not toks:
+            return False
+        head = toks[0]
+    base = head.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    if base.lower() in KNOWN_CMDS:
+        return True
+    if head.startswith(("./", "../", "~/")):
+        return True
+    # 带长/短选项、键值赋值或重定向的，基本是命令而不是日志
+    if len(toks) > 1 and re.search(r"(^|\s)(--?[A-Za-z0-9][\w-]*|[A-Z_]{3,}=|\||>|&&)", cmd):
+        return True
+    return bool(re.match(r"^[\w.~/-]+\.(sh|ps1|py|js|ts|rb|go|rs|jar)$", head))
+
+
+def extract_commands(md: str, max_cmds: int = 8) -> list[str]:
+    """从 README 的 shell 代码块里提炼可执行命令（去掉输出行、注释、提示符）。"""
+    out: list[str] = []
+    for lang, block in re.findall(r"```([^\n]*)\n(.*?)```", md or "", re.S):
+        if lang.strip().lower() not in SHELL_LANGS:
+            continue
+        buf = ""
+        for raw in block.splitlines():
+            line = raw.rstrip()
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            # 跳过明显的输出/结果行
+            if line.lstrip().startswith(("✓", "✔", "✗", "✘", "→", "…", "...")):
+                continue
+            line = re.sub(r"^\s*[$>]\s+", "", line)
+            if line.rstrip().endswith("\\"):
+                buf += line.rstrip()[:-1] + " "
+                continue
+            cmd = (buf + line).strip()
+            buf = ""
+            if not cmd or len(cmd) > 200:
+                continue
+            # 只留命令形态：不含中文散文、含至少一个字母
+            if not re.search(r"[A-Za-z]", cmd) or len(re.findall(r"[\u4e00-\u9fff]", cmd)) > 6:
+                continue
+            if NOISE_LINE.match(cmd) or not _looks_like_command(cmd):
+                continue
+            flat = re.sub(r"\s+", " ", cmd)
+            if flat not in out:
+                out.append(flat)
+            if len(out) >= max_cmds:
+                return out
+    return out
+
+
+RISK_RULES: list[tuple[str, str, re.Pattern]] = [
+    ("injection", "high", re.compile(r"(?i)\b(?:ignore|disregard|forget)\b[^.\n]{0,40}\b(?:previous|prior|above|earlier)\b[^.\n]{0,30}\b(?:instruction|prompt|rule)s?\b")),
+    ("injection", "high", re.compile(r"(?i)\b(?:you are now|from now on you|new instructions?|system prompt|act as (?:an? )?(?:admin|root|developer))\b")),
+    ("injection-zh", "high", re.compile(r"(?:忽略|无视|忘记|忘掉)[^。\n]{0,20}(?:之前|以上|前面|先前)[^。\n]{0,12}(?:指令|提示|规则|设定)")),
+    ("injection-zh", "high", re.compile(r"(?:你现在是|从现在起你|新的指令|系统提示词|无视安全)")),
+    ("exfiltration", "high", re.compile(r"(?i)\b(?:send|post|upload|exfiltrate|leak)\b[^.\n]{0,60}\b(?:api[_ -]?key|token|secret|credential|password|ssh key|\.env)\b")),
+    ("pipe-to-shell", "high", re.compile(r"(?i)\b(?:curl|wget|iex|iwr)\b[^\n|]{0,140}\|\s*(?:sudo\s+)?(?:ba)?sh\b")),
+    ("destructive", "high", re.compile(r"(?i)\brm\s+-rf\s+/(?:\s|$)|format\s+[a-z]:|del\s+/s\s+/q\s+c:\\\\|remove-item[^\n]{0,30}-recurse[^\n]{0,30}c:\\\\")),
+    ("secret", "high", re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b")),
+    ("hidden-unicode", "medium", re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")),
+    ("hidden-comment", "medium", re.compile(r"(?s)<!--(?:(?!-->).){0,400}?(?:ignore|instruction|system prompt|忽略)(?:(?!-->).){0,300}?-->")),
+]
+
+
+def scan_risks(text: str, where: str = "") -> list[dict]:
+    """扫 prompt injection / 危险命令 / 泄漏密钥 / 隐藏字符，每个规则只报第一处。"""
+    findings: list[dict] = []
+    for rule, level, rx in RISK_RULES:
+        m = rx.search(text or "")
+        if not m:
+            continue
+        snippet = one_line(m.group(0).replace("\n", " ").strip(), 120)
+        findings.append({"rule": rule, "level": level, "where": where, "match": snippet})
+        if len(findings) >= 4:
+            break
+    return findings
+
+
+def scan_bundle(path: Path) -> list[dict]:
+    if path.is_file():
+        return scan_risks(read_text(path), path.name)
+    findings: list[dict] = []
+    for p in sorted(path.rglob("*")):
+        if p.is_file() and p.suffix.lower() in TEXT_EXTS | {".gif", ".png"}:
+            if p.suffix.lower() in {".gif", ".png"}:
+                continue
+            findings.extend(scan_risks(read_text(p), p.relative_to(path).as_posix()))
+    return findings
+
+
+def render_risks(findings: list[dict], limit: int = 10) -> str:
+    if not findings:
+        return "风险扫描：未发现可疑内容（injection / 危险命令 / 密钥 / 隐藏字符）。"
+    lines = [f"风险扫描：{len(findings)} 处可疑"]
+    for f in findings[:limit]:
+        mark = "⚠" if f["level"] == "high" else "·"
+        lines.append(f"  {mark} [{f['level']}] {f['rule']} @ {f['where'] or '-'}: {f['match']}")
+    if len(findings) > limit:
+        lines.append(f"  … 另有 {len(findings) - limit} 处，用 --json 看全部")
+    return "\n".join(lines)
+
+
 def extract_sections(md: str) -> list[tuple[str, str]]:
     """把 markdown 拆成 (二级标题, 正文) 列表。"""
     sections: list[tuple[str, str]] = []
@@ -730,8 +855,19 @@ def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: d
         out.append("")
 
     if code:
-        out.append("## 快速开始（摘自 README，原样保留）")
+        out.append("## 快速开始")
         out.append("")
+        cmds = extract_commands(src.readme, 8)
+        if cmds:
+            out.append("先跑这些（从 README 的 shell 代码块里提炼，输出去掉了）：")
+            out.append("")
+            out.append("```bash")
+            for c in cmds:
+                out.append(c)
+            out.append("```")
+            out.append("")
+            out.append("原文示例（可能含注释与输出，原样保留）：")
+            out.append("")
         for i, b in enumerate(code, 1):
             out.append(f"```")
             out.append(truncate(b, 1400))
@@ -1074,6 +1210,15 @@ def cmd_build(args) -> int:
         gaps.append("可抽取的文档很少，建议把长文档放在 references/ 后重跑。")
     audit = {"gaps": gaps}
     skill_md = build_skill_md(src, name, refs, audit, profile)
+    risks = scan_risks(skill_md, "SKILL.md")
+    for rel, content in refs:
+        risks.extend(scan_risks(content, "references/" + rel))
+    high_risks = [r for r in risks if r["level"] == "high"]
+    if high_risks and getattr(args, "strict_risk", False):
+        print(f"风险扫描：{len(high_risks)} 处高风险，已按 --strict-risk 中止。", file=sys.stderr)
+        for r in high_risks[:6]:
+            print(f"  ⚠ {r['rule']} @ {r['where']}: {r['match']}", file=sys.stderr)
+        return 2
 
     out = Path(args.output) if args.output else Path(name)
     sorted_files = sorted(src.files.items())
@@ -1094,6 +1239,7 @@ def cmd_build(args) -> int:
         "budget": budget,
         "chars_total": sum(len(c) for _, c in refs),
         "gaps": gaps,
+        "risks": risks[:20],
         "commands": [f"python skillforge.py build {args.source} -o {out.as_posix()}"
                      + (f" --name {name}" if args.name else "")
                      + (f" --profile {profile}" if profile != "dsh" else "")],
@@ -1114,6 +1260,7 @@ def cmd_build(args) -> int:
         print(f"  SKILL.md  {len(skill_md):>7} 字符    profile={profile}")
         print(f"  references {len(refs):>6} 份 / {meta['chars_total']} 字符")
         print(f"  预计体检：{audit['score']}/100（{audit['grade']}） 正文 {audit.get('words', 0)} 词")
+        print("  " + render_risks(risks).replace("\n", "\n  "))
         if audit["issues"]:
             print("  待修：")
             for i in audit["issues"][:8]:
@@ -1136,6 +1283,7 @@ def cmd_build(args) -> int:
     print(f"  references {len(refs):>6} 份 / {meta['chars_total']} 字符")
     print(f"  来源材料 {len(src.files):>6} 个文本文件（{src.kind}）")
     print(f"  体检：{audit['score']}/100（{audit['grade']}） 正文 {audit.get('words', 0)} 词")
+    print("  " + render_risks(risks).replace("\n", "\n  "))
     if audit["issues"]:
         print("  待修：")
         for i in audit["issues"][:8]:
@@ -1369,10 +1517,13 @@ def cmd_lint(args) -> int:
     audit = score_bundle(d)
     text = read_text(d / "SKILL.md") if (d / "SKILL.md").exists() else ""
     fm = parse_frontmatter(text)
+    findings = scan_bundle(d)
+    high = [f for f in findings if f["level"] == "high"]
     if args.json:
         audit = dict(audit)
         audit["name"] = fm.get("name", "")
         audit["description"] = one_line(fm.get("description", ""), 480)
+        audit["risks"] = findings
         print(json.dumps(audit, ensure_ascii=False, indent=2))
         return 0 if audit["ok"] else 1
     print(f"{d}")
@@ -1380,11 +1531,35 @@ def cmd_lint(args) -> int:
     print(f"  description：{one_line(fm.get('description', '（缺失）'), 160)}")
     print(f"  体检：{audit['score']}/100（{audit['grade']}）")
     print(render_audit(audit))
+    print("  " + render_risks(findings).replace("\n", "\n  "))
+    if high:
+        print(f"  注意：发现 {len(high)} 处高风险内容——结构分不作数，建议先跑 scan 确认来源。")
     if audit["ok"]:
         print(f"  结论：通过（{audit['score']}/100，≥75 算健康）")
     else:
         print(f"  结论：不通过（{audit['score']}/100，<75）")
     return 0 if audit["ok"] else 1
+
+
+def cmd_scan(args) -> int:
+    target = Path(args.path)
+    if not target.exists():
+        raise SystemExit(f"路径不存在：{target}")
+    findings = scan_bundle(target)
+    high = [f for f in findings if f["level"] == "high"]
+    if args.json:
+        print(json.dumps({"path": str(target), "findings": findings,
+                          "high": len(high)}, ensure_ascii=False, indent=2))
+    else:
+        print(f"扫描：{target}")
+        print(render_risks(findings))
+        if high:
+            print(f"  结论：{len(high)} 处高风险——不建议直接装进 agent（先看引用来源，或裁剪后再用）")
+        else:
+            print("  结论：未发现高风险内容")
+    if high and not args.lenient:
+        return 1
+    return 0
 
 
 def cmd_selftest(args) -> int:
@@ -1448,7 +1623,8 @@ def main(argv=None) -> int:
                "  python skillforge.py install out/my-skill          # 装到 DSH/Claude 的 skills 目录\n"
                "  python skillforge.py lint --all                     # 批量体检已安装的 skill\n"
                "  python skillforge.py fix  out/my-skill\n"
-               "  python skillforge.py diff out/my-skill\n",
+               "  python skillforge.py diff out/my-skill\n"
+               "  python skillforge.py scan out/my-skill           # 扫 prompt injection / 危险命令\n",
     )
     ap.add_argument("--version", action="version", version=f"skillforge {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1462,6 +1638,7 @@ def main(argv=None) -> int:
     b.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help=f"references 总字符预算（默认 {DEFAULT_BUDGET}）")
     b.add_argument("--force", action="store_true", help="输出目录已存在时覆盖")
     b.add_argument("--dry-run", action="store_true", help="只预演：打印将生成什么、预计得分，不写盘")
+    b.add_argument("--strict-risk", action="store_true", help="风险扫描命中高风险时中止，不写盘（退出码 2）")
     b.add_argument("--json", action="store_true", help="额外输出机器可读 JSON")
 
     l = sub.add_parser("lint", help="体检一个（或全部）已有 skill 包")
@@ -1495,6 +1672,11 @@ def main(argv=None) -> int:
     s.add_argument("--min", type=int, default=0, help="低于该分数时退出码为 1（默认 0=不检查）")
     s.add_argument("--json", action="store_true")
 
+    sc = sub.add_parser("scan", help="扫 prompt injection / 危险命令 / 泄漏密钥 / 隐藏字符")
+    sc.add_argument("path", help="skill 包目录或单个文件")
+    sc.add_argument("--lenient", action="store_true", help="发现高风险也返回 0（默认返回 1）")
+    sc.add_argument("--json", action="store_true")
+
     sub.add_parser("selftest", help="运行内置自检")
 
     args = ap.parse_args(argv)
@@ -1520,6 +1702,8 @@ def main(argv=None) -> int:
         if args.min and a["score"] < args.min:
             return 1
         return 0
+    if args.cmd == "scan":
+        return cmd_scan(args)
     if args.cmd == "selftest":
         return cmd_selftest(args)
     ap.print_help()

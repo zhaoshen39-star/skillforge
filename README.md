@@ -46,8 +46,9 @@ python skillforge.py build https://github.com/pallets/click -o out/click-skill
 # 3) or from a single document
 python skillforge.py build ./paper.pdf -o out/paper-skill
 
-# 4) audit it, and let it fix the mechanical failures
+# 4) audit it, scan it, and let it fix the mechanical failures
 python skillforge.py lint out/my-skill
+python skillforge.py scan out/my-skill              # prompt injection / curl|sh / leaked keys
 python skillforge.py fix  out/my-skill
 
 # 5) install it where the runtime will actually find it
@@ -202,6 +203,32 @@ $ python skillforge.py fix ../my-skill
 Guard rail: if a directory has no `meta.json` / wasn't made by skillforge, `fix` exits
 with an explanation unless you pass `--force`. Hand-written wording is your asset.
 
+## Scan before you install: `scan`
+
+A skill generated from an untrusted page, a random fork, or a pasted PDF can carry text
+the agent will happily treat as instructions. `scan` inspects what `build` actually put in
+the bundle:
+
+- prompt injection (`ignore previous instructions`, 「忽略之前的指令」, fake system prompts)
+- pipe-to-shell installers (`curl … | sh`)
+- destructive commands (`rm -rf /`, `format c:`)
+- leaked credentials (`sk-…`, `ghp_…`, `AKIA…`, `.env` mentions next to "send/upload")
+- invisible characters and HTML comments that hide instructions
+
+```bash
+$ python skillforge.py scan out/repo-skill
+扫描：out/repo-skill
+风险扫描：2 处可疑
+  ⚠ [high] injection @ SKILL.md: Ignore all previous instructions
+  ⚠ [high] pipe-to-shell @ references/README.md: curl http://…/x.sh | sh
+  结论：2 处高风险——不建议直接装进 agent（先看引用来源，或裁剪后再用）
+```
+
+`build` runs the same scan and records findings in `meta.json`; `--strict-risk` aborts
+**before writing anything** (exit `2`). `lint` also reports risks, but its exit code stays
+tied to the structural score — use `scan` as the security gate in CI. A 100-point skill
+that says "ignore previous instructions" is exactly the case the separate gate exists for.
+
 ## What it does not do
 
 - It is **not** an LLM writer. If the source README is marketing fluff, the skill is thin — by design.
@@ -241,13 +268,14 @@ Exit codes are CI-friendly: `0` healthy, `1` unhealthy.
 
 ```
 python skillforge.py build  <source> [-o OUT] [--name NAME] [--profile dsh|claude|generic]
-                                      [--budget N] [--force] [--dry-run] [--json]
+                                      [--budget N] [--force] [--dry-run] [--strict-risk] [--json]
 python skillforge.py lint   <skill-dir> [--json]
 python skillforge.py lint   --all [--roots ROOT ...] [--min 75] [--json]
 python skillforge.py install <skill-dir> [--target auto|dsh|claude] [--dir PATH]
                                       [--force] [--dry-run] [--uninstall] [--list] [--json]
 python skillforge.py fix    <skill-dir> [--force] [--json]
 python skillforge.py diff   <skill-dir> [--json]        # 0 in sync, 1 stale
+python skillforge.py scan   <skill-dir> [--lenient] [--json]   # 0 clean, 1 high-risk
 python skillforge.py score  <skill-dir> [--min N] [--json]
 python skillforge.py selftest                           # bundled fixture, offline
 python skillforge.py --version
@@ -283,7 +311,9 @@ python skillforge.py diff out/my-skill                    # 源变了就退出�
 - [x] `--dry-run` — preview before writing
 - [x] `install` — copy into DSH/Claude skills root and verify it will be discovered
 - [x] `lint --all` — audit a whole skills library, CI-friendly exit code
-- [ ] prompt-injection scan for skills generated from untrusted web pages
+- [x] `scan` — prompt-injection / dangerous-command / leaked-secret scanner for generated skills
+- [x] extract runnable commands from README quick starts (prompts and install logs stripped)
+- [ ] multi-page docs index (numbered `docs/` references with a reading order)
 - [ ] `--from-tests` — derive `whenToUse` from example user queries
 - [ ] PDF layout handling beyond text extraction (`pypdf` optional)
 - [ ] `build --watch` — regenerate on source change
@@ -291,7 +321,7 @@ python skillforge.py diff out/my-skill                    # 源变了就退出�
 ## Tests
 
 ```bash
-python tests/verify_skillforge.py    # 85 checks, offline, no network
+python tests/verify_skillforge.py    # 102 checks, offline, no network
 python skillforge.py selftest        # 11 built-in checks on a fixture repo
 ```
 
