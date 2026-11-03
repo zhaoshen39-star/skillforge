@@ -752,9 +752,10 @@ def parse_frontmatter(text: str) -> dict:
 
 
 def count_words(text: str) -> int:
+    """字数当量：英文按词，中文按 2.2 字符≈1 词折算，避免中文正文被误判超长。"""
     cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
     words = len(re.findall(r"[A-Za-z0-9_]+", text))
-    return cjk + words
+    return int(round(cjk / 2.2 + words))
 
 
 def score_bundle(skill_dir: Path) -> dict:
@@ -772,9 +773,12 @@ def score_bundle(skill_dir: Path) -> dict:
     ref_files = sorted(p for p in refs_dir.rglob("*") if p.is_file()) if refs_dir.exists() else []
     words = count_words(body)
 
-    def add(id_: str, weight: int, ok: bool, hint: str, detail: str = "") -> None:
+    def add(id_: str, weight: int, ok: bool, hint: str, detail: str = "", points: int | None = None) -> None:
+        if points is None:
+            points = weight if ok else 0
+        points = max(0, min(weight, int(points)))
         items.append({"id": id_, "weight": weight, "ok": bool(ok),
-                      "points": weight if ok else 0, "hint": "" if ok else hint,
+                      "points": points, "hint": "" if ok else hint,
                       "detail": detail})
         if not ok:
             issues.append(f"{id_}: {hint}")
@@ -797,10 +801,14 @@ def score_bundle(skill_dir: Path) -> dict:
     add("body.todo", 8, not re.search(r"\bTODO\b", text.upper()),
         "正文里有 TODO 占位，安装方会以为没写完")
     add("refs.exists", 10, bool(ref_files), "没有 references/，细节无处安放（生成器会把 README 放进去）")
+    linked = [p for p in ref_files
+              if p.name in text or str(p.relative_to(skill_dir)).replace("\\", "/") in text]
+    linked_points = round(6 * len(linked) / len(ref_files)) if ref_files else 0
     add("refs.linked", 6,
-        bool(ref_files) and all(p.name in text or str(p.relative_to(skill_dir)).replace("\\", "/") in text
-                                for p in ref_files),
-        "有 references/ 文件没在正文里被引用（装了也不知道何时读）")
+        bool(ref_files) and linked_points >= 4,
+        f"有 {len(ref_files) - len(linked)}/{len(ref_files)} 份 references 没在正文里被引用（装了也不知道何时读）",
+        f"{len(linked)}/{len(ref_files)}",
+        points=linked_points)
     dup_ratio = 0.0
     lines = [ln.strip() for ln in body.splitlines() if len(ln.strip()) > 20]
     if lines:
@@ -913,10 +921,10 @@ def cmd_lint(args) -> int:
     print(f"  description：{one_line(fm.get('description', '（缺失）'), 160)}")
     print(f"  体检：{audit['score']}/100（{audit['grade']}）")
     print(render_audit(audit))
-    if audit["issues"]:
-        print("  结论：不通过（≥75 才算健康）")
+    if audit["ok"]:
+        print(f"  结论：通过（{audit['score']}/100，≥75 算健康）")
     else:
-        print("  结论：通过")
+        print(f"  结论：不通过（{audit['score']}/100，<75）")
     return 0 if audit["ok"] else 1
 
 
