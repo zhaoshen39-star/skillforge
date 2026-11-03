@@ -68,6 +68,11 @@ STOPWORDS = set("""
 the and for with that this from are was were you your our their his her its it is be to of in on at as
 by an or if then than so not no yes do does did done can could should would may might will just also
 使用 我们 你们 他们 这个 那个 可以 需要 支持 通过 以及 一个 没有 什么 如果 因为 所以 已经 进行
+turns turn into reads read uses using based allows allow includes include provides provide supports
+support ensures ensure helps help offers offer designed built simple easy tiny small fast better best
+new free open various many more most other some such only even like well need needs want wants get
+gets got make makes made take takes given give gives set sets run runs work works feature features
+dependency dependencies option options available
 """.split())
 SKIP_SECTION_TITLES = re.compile(
     r"^\s*(目录|contents|table of contents|toc|许可|license|licence|版权|"
@@ -319,13 +324,21 @@ def extract_summary(src: Source, limit: int = 600) -> str:
 
 def first_paragraph(body: str, limit: int) -> str:
     buf: list[str] = []
+    in_fence = False
     for ln in body.splitlines():
         s = ln.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            if buf:
+                break
+            continue
+        if in_fence:
+            continue
         if not s:
             if buf:
                 break
             continue
-        if buf and (s.startswith(("#", "|", "-", "*", ">", "```"))):
+        if buf and BLOCK_START.match(s):
             break
         buf.append(s)
         if sum(len(x) for x in buf) > limit:
@@ -334,15 +347,23 @@ def first_paragraph(body: str, limit: int) -> str:
     return clean_md(one_line(text, limit)) if len(text) >= 12 else ""
 
 
+BLOCK_START = re.compile(r"^(#{1,6}\s|\||-\s|\*\s|\d+\.\s|```|!\[|\[[!\[]|>)")
+CODEY = re.compile(
+    r"(^|\s)(cat|curl|wget|git|pip|pip3|npm|yarn|pnpm|docker|cd|ls|rm|python|python3|bash|sh|node|go|cargo|make|sudo|echo|export)\b"
+    r"|\|\s*[a-z][\w.-]*\s|--[a-z][\w-]+")
+
+
 def clean_paragraph(line: str, limit: int) -> str:
     s = line.strip()
     if len(s) < 30:
         return ""
-    if s.startswith(("#", "|", "-", "*", ">", "```", "!", "[!( ", "<")):
+    if BLOCK_START.match(s):
         return ""
     if REQUIREMENT_LINE.match(s):
         return ""
     if re.match(r"^\[.*\]\(.*\)$", s):
+        return ""
+    if CODEY.search(s):
         return ""
     return clean_md(one_line(s, limit))
 
@@ -438,21 +459,22 @@ def detect_language(src: Source) -> str:
     return "zh" if cjk * 3 >= latin else "en"
 
 
-def guess_triggers(src: Source, kws: list[str]) -> list[str]:
+def guess_triggers(src: Source, kws: list[str], lang: str = "zh") -> list[str]:
     """给 whenToUse 生成可读的触发描述（只用抽取到的标题/关键词，不编造事实）。"""
     triggers: list[str] = []
+    zh = lang == "zh"
     if src.readme:
         for title, body in extract_sections(src.readme):
-            if SKIP_SECTION_TITLES.match(title) or is_toc_section(body):
+            if not title or SKIP_SECTION_TITLES.match(title) or is_toc_section(body):
                 continue
             if not (USEFUL_HEADING.search(title)
                     or re.search(r"(是什么|简介|能力|功能|特性|feature)", title, re.I)):
                 continue
             t = one_line(title, 40)
             if t and not any(t in x for x in triggers):
-                triggers.append(f"用户问到「{t}」相关的用法时")
+                triggers.append(f"用户问到「{t}」相关的用法时" if zh else f'When the user asks about "{t}".')
     for kw in kws[:4]:
-        triggers.append(f"用户提到 `{kw}` 或需要解释它时")
+        triggers.append(f"用户提到 `{kw}` 或需要解释它时" if zh else f"When the user mentions `{kw}` and needs it explained.")
     return triggers[:8]
 
 
@@ -563,10 +585,10 @@ def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: d
     lang = detect_language(src)
     summary = extract_summary(src) or f"{src.title or name}（源材料：{src.label}）"
     headings = " ".join(t for t, _ in extract_sections(src.readme)) if src.readme else ""
-    kws = keywords(summary + "\n" + headings, 14, lang)
+    kws = keywords(summary + "\n" + (headings + "\n") * 3, 14, lang)
     if len(kws) < 4:
         kws = keywords((src.readme or "") + "\n" + (src.manifest or ""), 14, lang)
-    triggers = guess_triggers(src, kws)
+    triggers = guess_triggers(src, kws, lang)
     code = extract_code_blocks(src.readme, 3)
     core = useful_sections(src.readme)
 
