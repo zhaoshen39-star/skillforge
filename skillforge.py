@@ -5,16 +5,20 @@
 零依赖（纯标准库）。PDF 需要可选安装 pypdf。
 
 用法:
-  python skillforge.py build <source> -o out/      # repo 目录 / git URL / 文档文件 / 网页
-  python skillforge.py lint <skill_dir> [--json]   # 体检已有 skill 包
-  python skillforge.py score <skill_dir> [--json]  # 只打分
-  python skillforge.py selftest                    # 内置自检
+  python skillforge.py build <source> -o out/ [--profile dsh|claude|generic] [--dry-run]
+                                               # repo 目录 / git URL / 文档文件 / 网页
+  python skillforge.py lint <skill_dir> [--json]      # 体检已有 skill 包
+  python skillforge.py fix  <skill_dir> [--force]     # 自动修机械问题（不改内容）
+  python skillforge.py diff <skill_dir> [--json]      # 源材料变了没有（0 一致 / 1 过期）
+  python skillforge.py score <skill_dir> [--min N]    # 只打分，可做 CI 门禁
+  python skillforge.py selftest                       # 内置自检
 
 设计原则（和"生成一个能跑的东西"同样重要）:
   1. 确定性：同一输入 → 同样的 SKILL.md（不含时间戳），便于回归和审计。
   2. 可解释：每个分值/每行生成内容都能追溯到来源文件。
   3. 有预算：默认总预算 24000 字符，超出按优先级截断并记录日志。
   4. 不编造：只写从源材料抽取到的事实；缺什么就在"待补充"里列出。
+  5. 可维护：meta.json 记录源文件哈希，diff 能发现 skill 已落后于源。
 """
 from __future__ import annotations
 
@@ -39,7 +43,13 @@ try:  # 让 Windows 控制台也能输出中文/✓
 except Exception:
     pass
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+
+# skill 运行时的 frontmatter 习惯不同：
+#   dsh     — name / description / whenToUse（DSH 会读 whenToUse 做路由）
+#   claude  — 只读 name / description，触发条件必须塞进 description
+#   generic — 通用：保留 whenToUse，但 description 里也带触发词
+PROFILES = ("dsh", "claude", "generic")
 DEFAULT_BUDGET = 24000
 MAX_REF_CHARS = 8000
 
@@ -50,6 +60,12 @@ TEXT_EXTS = {
     ".rb", ".php", ".lua", ".vue", ".jsx", ".tsx", ".csv", ".env.example",
 }
 DOC_EXTS = {".md", ".markdown", ".rst", ".txt"}
+# 没有扩展名、但通常是高价值文本的裸文件名
+TEXT_NAMES = {
+    "license", "licence", "notice", "authors", "changelog", "contributing",
+    "makefile", "dockerfile", "procfile", "gemfile", "rakefile",
+    ".gitignore", ".dockerignore", ".editorconfig", ".npmrc", ".nvmrc",
+}
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "env", "dist", "build", "target", ".idea", ".vscode", ".dsh-vision-router",
@@ -180,13 +196,28 @@ class Source:
             self.files[rel] = text
 
 
+def _is_generated_bundle(p: Path) -> bool:
+    """目录里若有 skillforge 生成的 meta.json，则整棵子树都不是源材料（避免自我吞噬）。"""
+    m = p / "meta.json"
+    if not m.is_file():
+        return False
+    try:
+        return json.loads(read_text(m)).get("generator") == "skillforge"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def iter_text_files(root: Path, limit_files: int = 4000) -> list[Path]:
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".git"))
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in SKIP_DIRS and not _is_generated_bundle(Path(dirpath) / d)
+        )
         for fn in sorted(filenames):
             p = Path(dirpath) / fn
-            if p.suffix.lower() in TEXT_EXTS or fn.lower() in MANIFESTS or ENTRY_HINTS.match(fn):
+            if (p.suffix.lower() in TEXT_EXTS or fn.lower() in MANIFESTS
+                    or fn.lower() in TEXT_NAMES or ENTRY_HINTS.match(fn)):
                 if p.stat().st_size <= 2 * 1024 * 1024:
                     out.append(p)
             if len(out) >= limit_files:
@@ -601,9 +632,20 @@ def self_sorted_files(src: Source) -> list[tuple[str, str]]:
 
 # ───────────────────────── 生成 SKILL.md ─────────────────────────
 
-def build_frontmatter(name: str, description: str, when: list[str]) -> str:
-    lines = ["---", f"name: {name}", f"description: {one_line(description, 480)}"]
-    if when:
+def build_frontmatter(name: str, description: str, when: list[str], profile: str = "dsh") -> str:
+    """按目标运行时的习惯生成 frontmatter。
+
+    claude 只认 name + description，所以把触发条件折叠进 description；
+    其余 profile 额外挂 whenToUse 块。
+    """
+    desc = one_line(description, 480)
+    if profile == "claude" and when:
+        folded = " Use when the user: " + "; ".join(
+            one_line(w, 120).lstrip("- ").rstrip("。.;；") for w in when[:3]) + "."
+        if len(desc) + len(folded) <= 1000:
+            desc = desc + folded
+    lines = ["---", f"name: {name}", f"description: {desc}"]
+    if profile != "claude" and when:
         lines.append("whenToUse: |")
         for w in when:
             lines.append("  - " + one_line(w, 200))
@@ -611,7 +653,8 @@ def build_frontmatter(name: str, description: str, when: list[str]) -> str:
     return "\n".join(lines)
 
 
-def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: dict) -> str:
+def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: dict,
+                   profile: str = "dsh") -> str:
     lang = detect_language(src)
     summary = extract_summary(src) or f"{src.title or name}（源材料：{src.label}）"
     headings = " ".join(
@@ -626,14 +669,20 @@ def build_skill_md(src: Source, name: str, refs: list[tuple[str, str]], audit: d
     core = useful_sections(src.readme)
 
     desc = summary
-    if lang == "en":
-        trig = ", ".join(f"`{k}`" for k in kws[:6])
-        desc = (desc + f" Use when the user asks about {trig or 'this project'}.").strip()
+    trig_words = ", ".join(f"`{k}`" for k in kws[:6])
+    if profile == "claude":
+        # 只读 name+description 的运行时：触发词必须写进 description
+        if lang == "en":
+            desc = (desc + f" Use when the user asks about {trig_words or 'this project'}.").strip()
+        elif kws:
+            desc = (desc.rstrip("。.") + "。当用户问到「" + "」「".join(kws[:6]) + "」等主题时使用。").strip()
+    elif lang == "en":
+        desc = (desc + f" Use when the user asks about {trig_words or 'this project'}.").strip()
     else:
         desc = (desc + "（触发词：" + "、".join(kws[:6]) + "）").strip() if kws else desc
 
     out: list[str] = []
-    out.append(build_frontmatter(name, desc, triggers))
+    out.append(build_frontmatter(name, desc, [] if profile == "claude" else triggers, profile))
     out.append("")
     out.append(f"# {md_heading(src.readme) or src.title or name}")
     out.append("")
@@ -769,6 +818,13 @@ def score_bundle(skill_dir: Path) -> dict:
     text = read_text(skill_md)
     fm = parse_frontmatter(text)
     body = re.sub(r"(?s)^---\n.*?\n---\s*\n", "", text)
+    meta_path = skill_dir / "meta.json"
+    profile = "dsh"
+    if meta_path.exists():
+        try:
+            profile = (json.loads(read_text(meta_path)).get("profile") or "dsh")
+        except ValueError:
+            profile = "dsh"
     refs_dir = skill_dir / "references"
     ref_files = sorted(p for p in refs_dir.rglob("*") if p.is_file()) if refs_dir.exists() else []
     words = count_words(body)
@@ -795,7 +851,12 @@ def score_bundle(skill_dir: Path) -> dict:
         any(w in desc.lower() for w in ("use when", "when the user", "当用户", "用于", "触发"))
         or (len(when.strip()) >= 20 and len(desc) >= 80),
         "description 里没有触发条件（建议含 “Use when …” 或 “当用户…时”，或补 whenToUse）")
-    add("whenToUse.exists", 10, bool(when.strip()), "缺少 whenToUse（多条触发场景更好）")
+    when_ok = bool(when.strip()) or (
+        profile == "claude"
+        and any(w in desc.lower() for w in ("use when", "when the user", "当用户"))
+    )
+    add("whenToUse.exists", 10, when_ok,
+        "缺少 whenToUse（多条触发场景更好；claude profile 可把触发词写进 description）")
     add("body.min", 10, words >= 120, f"正文只有 {words} 词，太薄（建议 ≥120 词/字）")
     add("body.max", 6, words <= 6000, f"正文 {words} 词，超出建议上限 6000（细节拆进 references）")
     add("body.todo", 8, not re.search(r"\bTODO\b", text.upper()),
@@ -837,8 +898,20 @@ def render_audit(audit: dict) -> str:
 
 # ───────────────────────── 命令 ─────────────────────────
 
+def _write_bundle(out: Path, skill_md: str, refs: list[tuple[str, str]], meta: dict) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    if refs:
+        (out / "references").mkdir(exist_ok=True)
+        for rel, content in refs:
+            (out / "references" / rel).write_text(content, encoding="utf-8")
+    (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                                   encoding="utf-8")
+
+
 def cmd_build(args) -> int:
     src = load_source(args.source, args)
+    profile = getattr(args, "profile", "dsh") or "dsh"
     budget = args.budget
     name = slugify(args.name) if args.name else slugify(src.title or src.label)
     refs = pick_references(src, budget)
@@ -848,39 +921,66 @@ def cmd_build(args) -> int:
     if len(refs) <= 1:
         gaps.append("可抽取的文档很少，建议把长文档放在 references/ 后重跑。")
     audit = {"gaps": gaps}
-    skill_md = build_skill_md(src, name, refs, audit)
+    skill_md = build_skill_md(src, name, refs, audit, profile)
 
     out = Path(args.output) if args.output else Path(name)
-    if out.exists() and args.force:
-        shutil.rmtree(out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "SKILL.md").write_text(skill_md, encoding="utf-8")
-    if refs:
-        (out / "references").mkdir(exist_ok=True)
-        for rel, content in refs:
-            (out / "references" / rel).write_text(content, encoding="utf-8")
+    sorted_files = sorted(src.files.items())
     meta = {
         "version": VERSION,
         "generator": "skillforge",
         "source": src.label,
         "source_kind": src.kind,
+        "source_root": str(src.root) if src.root else None,
+        "profile": profile,
         "name": name,
         "inputs": len(src.files),
+        "source_files_total": len(sorted_files),
+        "source_files": [{"path": rel, "sha256": sha256_text(text), "chars": len(text)}
+                         for rel, text in sorted_files[:400]],
         "references": [{"path": "references/" + r, "chars": len(c), "sha256": sha256_text(c)}
                        for r, c in refs],
         "budget": budget,
         "chars_total": sum(len(c) for _, c in refs),
         "gaps": gaps,
-        "commands": [f"python skillforge.py build {args.source} -o {out.as_posix()}"],
+        "commands": [f"python skillforge.py build {args.source} -o {out.as_posix()}"
+                     + (f" --name {name}" if args.name else "")
+                     + (f" --profile {profile}" if profile != "dsh" else "")],
     }
-    (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    if getattr(args, "dry_run", False):
+        tmp = Path(tempfile.mkdtemp(prefix="skillforge-preview-"))
+        try:
+            _write_bundle(tmp, skill_md, refs, meta)
+            audit = score_bundle(tmp)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if args.json:
+            print(json.dumps({"dry_run": True, "planned_out": str(out), "meta": meta,
+                              "audit": audit}, ensure_ascii=False, indent=2))
+            return 0 if audit["ok"] else 3
+        print(f"（预演，不写盘）将生成：{out}")
+        print(f"  SKILL.md  {len(skill_md):>7} 字符    profile={profile}")
+        print(f"  references {len(refs):>6} 份 / {meta['chars_total']} 字符")
+        print(f"  预计体检：{audit['score']}/100（{audit['grade']}） 正文 {audit.get('words', 0)} 词")
+        if audit["issues"]:
+            print("  待修：")
+            for i in audit["issues"][:8]:
+                print("   - " + i)
+        print("  去掉 --dry-run 即写入。")
+        return 0 if audit["ok"] else 3
+
+    if out.exists():
+        if not args.force and any(out.iterdir()):
+            raise SystemExit(f"输出目录已存在且非空：{out}（加 --force 覆盖，或用 -o 换目录）")
+        if args.force:
+            shutil.rmtree(out)
+    _write_bundle(out, skill_md, refs, meta)
     audit = score_bundle(out)
     if args.json:
         print(json.dumps({"out": str(out), "meta": meta, "audit": audit}, ensure_ascii=False, indent=2))
         return 0 if audit["ok"] else 3
     print(f"已生成：{out}")
-    print(f"  SKILL.md  {len(skill_md):>7} 字符")
+    print(f"  SKILL.md  {len(skill_md):>7} 字符    profile={profile}")
     print(f"  references {len(refs):>6} 份 / {meta['chars_total']} 字符")
     print(f"  来源材料 {len(src.files):>6} 个文本文件（{src.kind}）")
     print(f"  体检：{audit['score']}/100（{audit['grade']}） 正文 {audit.get('words', 0)} 词")
@@ -901,6 +1001,162 @@ def load_source(source: str, args) -> Source:
             return load_git(source)
         return load_url(source)
     raise SystemExit(f"找不到源：{source}（既不是本地路径，也不是支持的网络地址）")
+
+
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """返回 (frontmatter 块含 --- 分隔, 正文)。没有 frontmatter 时返回 ("", text)。"""
+    m = re.match(r"(?s)^---\n.*?\n---\s*\n", text)
+    if not m:
+        return "", text
+    return m.group(0), text[m.end():]
+
+
+def cmd_diff(args) -> int:
+    """检查 skill 是否落后于源材料：重读源、对比 meta.json 里记录的哈希。"""
+    d = Path(args.skill_dir)
+    meta_path = d / "meta.json"
+    if not meta_path.exists():
+        raise SystemExit(f"没有 meta.json：{meta_path}（只有 build 生成的目录才能 diff）")
+    try:
+        meta = json.loads(read_text(meta_path))
+    except ValueError as e:
+        raise SystemExit(f"meta.json 不是合法 JSON：{e}")
+    recorded = {f["path"]: f["sha256"] for f in meta.get("source_files", [])}
+    total = int(meta.get("source_files_total") or len(recorded))
+    root = meta.get("source_root")
+    label = meta.get("source") or ""
+
+    if root and Path(root).exists():
+        src = load_local_dir(Path(root)) if Path(root).is_dir() else load_single_file(Path(root))
+    elif label and Path(label).exists():
+        src = load_local_dir(Path(label)) if Path(label).is_dir() else load_single_file(Path(label))
+    elif label:
+        print(f"源材料不在本地（{label}），重新克隆/抓取后比对…", file=sys.stderr)
+        src = load_source(label, None)
+    else:
+        raise SystemExit("meta.json 里没有 source / source_root，无法定位源材料")
+
+    current = {rel: sha256_text(text) for rel, text in sorted(src.files.items())}
+    added = sorted(set(current) - set(recorded))
+    removed = sorted(set(recorded) - set(current))
+    changed = sorted(k for k in set(current) & set(recorded) if current[k] != recorded[k])
+    truncated = len(recorded) < total
+    stale = bool(added or removed or changed or len(current) != total)
+    result = {
+        "skill_dir": str(d), "source": label,
+        "recorded_files": len(recorded), "current_files": len(current),
+        "truncated": truncated, "stale": stale,
+        "added": added, "removed": removed, "changed": changed,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if stale else 0
+    print(f"{d}")
+    print(f"  源：{label}（{len(recorded)}/{total} 个文件有哈希记录）")
+    if truncated:
+        print("  注意：meta.json 只记录了前 400 个文件，大批量改动可能漏报。")
+    if not stale:
+        print(f"  一致：{len(current)} 个源文件自上次生成后没有变化。")
+        return 0
+    print("  已过期：源材料变了，建议重跑 meta.json 里 commands 记录的命令。")
+    for title, rows in (("新增", added), ("删除", removed), ("修改", changed)):
+        if rows:
+            print(f"  {title} {len(rows)} 个：")
+            for r in rows[:10]:
+                print("   - " + r)
+            if len(rows) > 10:
+                print(f"   … 另有 {len(rows) - 10} 个")
+    if len(current) != total:
+        print(f"  文件总数：{total} → {len(current)}")
+    return 1
+
+
+def cmd_fix(args) -> int:
+    """自动修机械问题：name / description / whenToUse / references 链接。不动正文内容。"""
+    d = Path(args.skill_dir)
+    skill_md = d / "SKILL.md"
+    if not skill_md.exists():
+        raise SystemExit(f"没有 SKILL.md：{skill_md}")
+    meta_path = d / "meta.json"
+    if not getattr(args, "force", False):
+        generated = False
+        if meta_path.exists():
+            try:
+                generated = json.loads(read_text(meta_path)).get("generator") == "skillforge"
+            except ValueError:
+                generated = False
+        if not generated:
+            raise SystemExit(
+                f"拒绝修改：{d} 不是 skillforge 生成的（没有 meta.json 或 generator 不符）。\n"
+                "手写 skill 的措辞是你的资产，自动改写会破坏它；确认要改请加 --force。"
+            )
+    text = read_text(skill_md)
+    fm = parse_frontmatter(text)
+    _, body = _split_frontmatter(text)
+    changes: list[str] = []
+
+    old_name = (fm.get("name") or "").strip()
+    name = slugify(old_name or d.name)
+    if name != old_name:
+        changes.append(f"name：{old_name or '（缺失）'} → {name}")
+
+    desc = (fm.get("description") or "").strip()
+    if len(desc) < 12:
+        derived = first_body_paragraph(body, 300) or f"{name}：由 skillforge 生成、用于回答相关问题的 skill。"
+        desc = one_line(clean_md(derived), 480)
+        changes.append(f"description：重写（{len(desc)} 字符）")
+    if not any(w in desc.lower() for w in ("use when", "when the user", "当用户", "用于", "触发")):
+        zh = bool(re.search(r"[\u4e00-\u9fff]", body))
+        desc = desc.rstrip("。.") + ("。当用户问到相关主题时使用。" if zh else ". Use when the user asks about this topic.")
+        changes.append("description：补触发条件")
+
+    when: list[str] = [x.strip("- ").strip() for x in str(fm.get("whenToUse") or "").splitlines() if x.strip()]
+    if not when:
+        lang = "zh" if re.search(r"[\u4e00-\u9fff]", body) else "en"
+        kws = keywords(body, 6, lang)
+        when = [f"用户问到「{k}」或需要它时" if lang == "zh" else f"the user asks about `{k}`"
+                for k in kws[:3]]
+        if not when:
+            when = ["用户需要该 skill 描述的能力时" if lang == "zh" else "the user needs this skill's capability"]
+        changes.append(f"whenToUse：补 {len(when)} 条")
+
+    profile = "dsh"
+    if meta_path.exists():
+        try:
+            profile = json.loads(read_text(meta_path)).get("profile") or "dsh"
+        except ValueError:
+            pass
+
+    refs_dir = d / "references"
+    if refs_dir.exists():
+        ref_files = sorted(p.name for p in refs_dir.rglob("*") if p.is_file())
+        unlinked = [n for n in ref_files if n not in body and f"references/{n}" not in body]
+        if unlinked:
+            body = body.rstrip() + "\n\n## 参考文件\n\n" + "\n".join(
+                f"- `references/{n}` — 细节见该文件" for n in unlinked) + "\n"
+            changes.append(f"参考文件：补 {len(unlinked)} 条链接")
+
+    if not changes:
+        print(f"{d}")
+        print("  无需修复：机械项都已达标。")
+        return 0
+
+    new_text = build_frontmatter(name, desc, when, profile) + "\n" + body.lstrip("\n")
+    skill_md.write_text(new_text, encoding="utf-8")
+    audit = score_bundle(d)
+    if args.json:
+        print(json.dumps({"skill_dir": str(d), "changes": changes, "audit": audit},
+                         ensure_ascii=False, indent=2))
+        return 0 if audit["ok"] else 1
+    print(f"{d}")
+    for c in changes:
+        print("  ✓ " + c)
+    print(f"  修复后体检：{audit['score']}/100（{audit['grade']}）")
+    if not audit["ok"] and audit["issues"]:
+        print("  仍需手工处理：")
+        for i in audit["issues"][:8]:
+            print("   - " + i)
+    return 0 if audit["ok"] else 1
 
 
 def cmd_lint(args) -> int:
@@ -983,8 +1239,11 @@ def main(argv=None) -> int:
         epilog="例子：\n"
                "  python skillforge.py build ./my-repo -o out/my-skill\n"
                "  python skillforge.py build https://github.com/user/repo -o out/repo-skill\n"
-               "  python skillforge.py build paper.pdf -o out/paper-skill\n"
-               "  python skillforge.py lint out/my-skill\n",
+               "  python skillforge.py build paper.pdf -o out/paper-skill --profile claude\n"
+               "  python skillforge.py build ./my-repo -o out/x --dry-run\n"
+               "  python skillforge.py lint out/my-skill\n"
+               "  python skillforge.py fix  out/my-skill\n"
+               "  python skillforge.py diff out/my-skill\n",
     )
     ap.add_argument("--version", action="version", version=f"skillforge {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -993,16 +1252,29 @@ def main(argv=None) -> int:
     b.add_argument("source", help="本地目录/文件、git URL、网页 URL 或 PDF")
     b.add_argument("-o", "--output", help="输出目录（默认 ./<name>）")
     b.add_argument("--name", help="skill 名（默认从源名推断，kebab-case）")
+    b.add_argument("--profile", choices=PROFILES, default="dsh",
+                   help="目标运行时：dsh（含 whenToUse）/ claude（触发词折叠进 description）/ generic")
     b.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help=f"references 总字符预算（默认 {DEFAULT_BUDGET}）")
     b.add_argument("--force", action="store_true", help="输出目录已存在时覆盖")
+    b.add_argument("--dry-run", action="store_true", help="只预演：打印将生成什么、预计得分，不写盘")
     b.add_argument("--json", action="store_true", help="额外输出机器可读 JSON")
 
     l = sub.add_parser("lint", help="体检一个已有 skill 包")
     l.add_argument("skill_dir")
     l.add_argument("--json", action="store_true")
 
+    fx = sub.add_parser("fix", help="自动修复机械问题（name/description/whenToUse/引用链接）")
+    fx.add_argument("skill_dir")
+    fx.add_argument("--force", action="store_true", help="允许修改非 skillforge 生成的目录")
+    fx.add_argument("--json", action="store_true")
+
+    df = sub.add_parser("diff", help="检查 skill 是否落后于源材料（对比 meta.json 里的哈希）")
+    df.add_argument("skill_dir")
+    df.add_argument("--json", action="store_true")
+
     s = sub.add_parser("score", help="只打分")
     s.add_argument("skill_dir")
+    s.add_argument("--min", type=int, default=0, help="低于该分数时退出码为 1（默认 0=不检查）")
     s.add_argument("--json", action="store_true")
 
     sub.add_parser("selftest", help="运行内置自检")
@@ -1012,12 +1284,18 @@ def main(argv=None) -> int:
         return cmd_build(args)
     if args.cmd == "lint":
         return cmd_lint(args)
+    if args.cmd == "fix":
+        return cmd_fix(args)
+    if args.cmd == "diff":
+        return cmd_diff(args)
     if args.cmd == "score":
         a = score_bundle(Path(args.skill_dir))
         if args.json:
             print(json.dumps(a, ensure_ascii=False, indent=2))
         else:
             print(f"{a['score']}/100（{a['grade']}）")
+        if args.min and a["score"] < args.min:
+            return 1
         return 0
     if args.cmd == "selftest":
         return cmd_selftest(args)

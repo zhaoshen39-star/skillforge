@@ -202,6 +202,85 @@ def main() -> int:
         check("**" not in desc, "K1 description 无 markdown 粗体残留")
         check(not desc.startswith("是："), "K2 description 无「是：」标签残留")
         check(len(desc) <= 480, "K3 description 不超长")
+        # L. --profile claude：不写 whenToUse，触发词进 description
+        out_claude = tmp / "out-claude"
+        p = run("build", str(demo), "-o", str(out_claude), "--profile", "claude")
+        check(p.returncode == 0, "L1 claude profile 生成成功")
+        cskill = (out_claude / "SKILL.md").read_text(encoding="utf-8")
+        check("whenToUse:" not in cskill, "L2 claude profile 不写 whenToUse")
+        check("use when" in cskill.lower(), "L3 claude profile 触发词进 description")
+        cmeta = json.loads((out_claude / "meta.json").read_text(encoding="utf-8"))
+        check(cmeta.get("profile") == "claude", "L4 meta.profile 记录 claude")
+        p = run("lint", str(out_claude))
+        check(p.returncode == 0, "L5 claude profile 体检不因 whenToUse 掉分")
+
+        # M. --dry-run：打预演、不落盘
+        dry = tmp / "out-dry"
+        p = run("build", str(demo), "-o", str(dry), "--dry-run")
+        check(p.returncode == 0, "M1 dry-run 退出码 0")
+        check("预演" in p.stdout, "M2 dry-run 打印预演")
+        check(not dry.exists(), "M3 dry-run 不写盘")
+
+        # N. diff：一致 → 0；改源 → 1 并列出改动
+        p = run("diff", str(out))
+        check(p.returncode == 0, "N1 diff 一致时退出码 0")
+        check("一致" in p.stdout, "N2 diff 报告一致")
+        demo_doc = demo / "docs" / "design.md"
+        demo_doc.write_text(demo_doc.read_text(encoding="utf-8") + "\n<!-- touched -->\n", encoding="utf-8")
+        p = run("diff", str(out))
+        check(p.returncode == 1, "N3 源变化后 diff 退出码 1")
+        check("修改" in p.stdout and "design.md" in p.stdout, "N4 diff 列出被改文件")
+        (demo / "docs" / "new.md").write_text("# New\n\nA new doc.\n", encoding="utf-8")
+        p = run("diff", str(out))
+        check("新增" in p.stdout and "new.md" in p.stdout, "N5 diff 列出新增文件")
+        p = run("diff", str(out), "--json")
+        try:
+            d = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            d = {}
+        check(d.get("stale") is True, "N6 diff --json 输出 stale=true")
+
+        # O. fix：机械问题自动修
+        bad = tmp / "bad-skill"
+        (bad / "references").mkdir(parents=True)
+        (bad / "references" / "extra.md").write_text("# Extra\n\ndetails\n", encoding="utf-8")
+        (bad / "SKILL.md").write_text(
+            "---\nname: Bad Skill\ndescription: stuff\n---\n\n# Bad Skill\n\n"
+            + ("This widget tool does useful things. " * 12) + "\n",
+            encoding="utf-8")
+        p = run("lint", str(bad))
+        check(p.returncode == 1, "O1 坏 skill 体检不通过")
+        p = run("fix", str(bad))
+        check(p.returncode != 0, "O2 未声明的 skill 默认拒绝修改（保护手写措辞）")
+        (bad / "meta.json").write_text(json.dumps({"generator": "skillforge", "profile": "dsh"}),
+                                       encoding="utf-8")
+        p = run("fix", str(bad))
+        check(p.returncode == 0, "O3 fix 后达到健康线")
+        fixed = (bad / "SKILL.md").read_text(encoding="utf-8")
+        check("name: bad-skill" in fixed, "O4 fix 规范化 name")
+        check("whenToUse:" in fixed, "O5 fix 补 whenToUse")
+        check("references/extra.md" in fixed, "O6 fix 补 references 链接")
+        p = run("fix", str(bad))
+        check(p.returncode == 0 and "无需修复" in p.stdout, "O7 二次 fix 幂等")
+
+        # P. score --min 作为 CI 门禁
+        p = run("score", str(out), "--min", "100")
+        check(p.returncode == 0, "P1 score --min 达标退出 0")
+        p = run("score", str(bad), "--min", "95")
+        check(p.returncode == 1, "P2 score --min 不达标退出 1")
+
+        # Q. meta 记录升级
+        raw = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        check(raw.get("version") == "0.2.0", "Q1 meta.version 为 0.2.0")
+        check(raw.get("profile") == "dsh", "Q2 meta.profile 默认为 dsh")
+        check(len(raw.get("source_files", [])) >= 3, "Q3 meta 记录源文件哈希")
+        check(bool(raw.get("source_root")), "Q4 meta 记录 source_root")
+
+        # R. 已存在的输出目录需要 --force
+        p = run("build", str(demo), "-o", str(out))
+        check(p.returncode != 0, "R1 非空输出目录默认拒绝覆盖")
+        p = run("build", str(demo), "-o", str(out), "--force")
+        check(p.returncode == 0, "R2 --force 允许覆盖")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

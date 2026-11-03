@@ -1,6 +1,6 @@
 # skillforge
 
-**Turn any repo, doc, or PDF into an agent skill — then score it, lint it, and prove it's reproducible.**
+**Turn any repo, doc, or PDF into an agent skill — then score it, lint it, fix it, and prove it's reproducible.**
 
 [![tests](https://github.com/zhaoshen39-star/skillforge/actions/workflows/tests.yml/badge.svg)](https://github.com/zhaoshen39-star/skillforge/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -12,17 +12,20 @@ Most "skill generators" are prompt templates: you paste a README into an LLM and
 
 - **Deterministic** — same input, byte-identical output. No model in the loop.
 - **Zero dependencies** — pure Python standard library.
-- **Two-way** — generate skills *from* sources, and audit skills *you* wrote.
+- **Full loop** — generate a skill, audit it, auto-fix the mechanical failures, and detect when it goes stale.
 - **Honest** — it never invents facts; anything missing is listed under *known gaps*.
 
 ```
 source (repo / dir / PDF / URL)
         │  extract README, docs, entry points, manifest
         ▼
-   SKILL.md  +  references/*  +  meta.json
-        │  generate stable YAML frontmatter
+   SKILL.md  +  references/*  +  meta.json   (with per-file hashes)
+        │  fixed, deterministic frontmatter per target runtime
         ▼
    audit score (12 weighted checks) → 0–100 + letter grade
+        │
+        ├─ fix   → repair name / description / whenToUse / dangling refs
+        └─ diff  → did the source change since generation?
 ```
 
 ## Quick start
@@ -40,17 +43,31 @@ python skillforge.py build https://github.com/pallets/click -o out/click-skill
 # 3) or from a single document
 python skillforge.py build ./paper.pdf -o out/paper-skill
 
-# 4) audit it
+# 4) audit it, and let it fix the mechanical failures
 python skillforge.py lint out/my-skill
+python skillforge.py fix  out/my-skill
+
+# 5) later: is the skill still in sync with the source?
+python skillforge.py diff out/my-skill
 ```
 
 ```
 已生成：out/my-skill
-  SKILL.md     1181 字符
+  SKILL.md     1181 字符    profile=dsh
   references      5 份 / 24000 字符
   来源材料     85 个文本文件（dir）
   体检：100/100（A） 正文 353 词
 ```
+
+### Pick your target runtime
+
+```bash
+python skillforge.py build ./my-repo -o out/skill --profile dsh     # name / description / whenToUse (default)
+python skillforge.py build ./my-repo -o out/skill --profile claude  # only name / description — triggers folded in
+python skillforge.py build ./my-repo -o out/skill --profile generic
+```
+
+`--dry-run` shows exactly what would be generated and what it would score, without writing anything.
 
 ## What you get
 
@@ -59,7 +76,7 @@ python skillforge.py lint out/my-skill
 ```
 SKILL.md          # installable skill: frontmatter + distilled body
 references/       # README, docs, entry code (budgeted, truncated with markers)
-meta.json         # source, hashes, gaps, and the exact command to regenerate
+meta.json         # source, per-file hashes, gaps, profile, regenerate command
 ```
 
 `SKILL.md` has a fixed, predictable shape:
@@ -93,7 +110,7 @@ whenToUse: |
 | `name.kebab` | 10 | non-installable names (`My Skill`, spaces, CJK) |
 | `description.exists` | 12 | missing `description` — skills silently fail to load |
 | `description.has_trigger` | 10 | description with no trigger words (never gets selected) |
-| `whenToUse.exists` | 10 | no routing block |
+| `whenToUse.exists` | 10 | no routing block (waived for `--profile claude`) |
 | `body.min` | 10 | stub skills with nothing to act on |
 | `body.max` | 6 | over-long dumps (≈6000 words, CJK folded at 2.2 chars/word) |
 | `body.todo` | 8 | leftover `TODO` / `待补充` |
@@ -103,18 +120,51 @@ whenToUse: |
 | `no_placeholder` | 6 | `xxx`, `<your-name>`, `FIXME` |
 | `headings` | 6 | body with no `##` structure |
 
-`lint` prints the failing checks with a one-line hint each; `score --json` is meant for CI.
+`lint` prints the failing checks with a one-line hint each; `score --json` is meant for CI:
 
 ```bash
-python skillforge.py score out/my-skill --json | python -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d['score']>=90 else 1)"
+python skillforge.py score out/my-skill --json --min 90   # exit 1 if below 90
 ```
+
+## Keep skills from rotting: `diff` and `fix`
+
+Generation is only half the problem — skills go stale silently. `meta.json` stores a
+SHA-256 for every source file, so `diff` can tell you exactly what changed:
+
+```bash
+$ python skillforge.py diff out/click-skill
+out/click-skill
+  源：https://github.com/pallets/click（142/142 个文件有哈希记录）
+  已过期：源材料变了，建议重跑 meta.json 里 commands 记录的命令。
+  修改 2 个：
+   - docs/arguments.md
+   - src/click/core.py
+```
+
+`fix` repairs the mechanical failures, and refuses to touch skills it didn't generate:
+
+```bash
+$ python skillforge.py lint ../my-skill
+  体检：36/100（D）   ← name "My Skill", 11-char description, no whenToUse, dangling ref
+
+$ python skillforge.py fix ../my-skill
+  ✓ name：My Skill → my-skill
+  ✓ description：重写（142 字符）
+  ✓ whenToUse：补 3 条
+  ✓ 参考文件：补 1 条链接
+  修复后体检：84/100（B）
+```
+
+Guard rail: if a directory has no `meta.json` / wasn't made by skillforge, `fix` exits
+with an explanation unless you pass `--force`. Hand-written wording is your asset.
 
 ## What it does not do
 
 - It is **not** an LLM writer. If the source README is marketing fluff, the skill is thin — by design.
 - It does **not** invent commands, versions, or API names. Every line comes from the source.
 - It is **not** a prompt benchmark. The score measures skill *structure*, not whether a model likes it.
-- It does **not** need network access at runtime (only `build <git-url>` clones).
+- `fix` only repairs structure (name / description / routing / dangling references), never content.
+- It does **not** need network access at runtime (only `build <git-url>` clones, `build <url>` fetches).
 
 ## Audit an existing skill
 
@@ -139,16 +189,20 @@ description：Does stuff.
 Four of those fail silently in production: a non-kebab `name`, an 11-character
 description, no `whenToUse`, and a reference file nothing links to.
 Fix them and the skill starts being selected — that's the whole point.
+Run `fix` for the mechanical ones, `--force` only when you mean it.
 
 Exit codes are CI-friendly: `0` healthy, `1` unhealthy.
 
 ## CLI
 
 ```
-python skillforge.py build <source> [-o OUT] [--name NAME] [--budget N] [--force] [--json]
-python skillforge.py lint  <skill-dir> [--json]
-python skillforge.py score <skill-dir> [--json]     # 0–100, for CI
-python skillforge.py selftest                       # bundled fixture, offline
+python skillforge.py build  <source> [-o OUT] [--name NAME] [--profile dsh|claude|generic]
+                                      [--budget N] [--force] [--dry-run] [--json]
+python skillforge.py lint   <skill-dir> [--json]
+python skillforge.py fix    <skill-dir> [--force] [--json]
+python skillforge.py diff   <skill-dir> [--json]        # 0 in sync, 1 stale
+python skillforge.py score  <skill-dir> [--min N] [--json]
+python skillforge.py selftest                           # bundled fixture, offline
 python skillforge.py --version
 ```
 
@@ -156,27 +210,31 @@ python skillforge.py --version
 
 ## Chinese
 
-**把任意 repo / 文档 / PDF 变成 agent skill，并给它打分、体检、保证可复现。**
+**把任意 repo / 文档 / PDF 变成 agent skill，并给它打分、体检、自动修、检查是否过期。**
 
 - 同一输入 → 完全相同的输出（不调模型，不掷骰子）
 - 纯标准库，零第三方依赖
-- 能生成，也能体检你手写的 skill（12 项加权 → 0–100）
-- 不编造事实：源材料没写的，就列进「待补充」
+- 五条命令形成闭环：`build` 生成 → `lint` 体检 → `fix` 修机械问题 → `diff` 查过期 → `score` 做 CI 门禁
+- 不编造事实：源材料没写的，就列进「待补充」；`fix` 只改结构不改内容
 
 ```bash
-python skillforge.py build ./my-repo -o out/my-skill
+python skillforge.py build ./my-repo -o out/my-skill --profile dsh
 python skillforge.py lint out/my-skill
+python skillforge.py fix  out/my-skill
+python skillforge.py diff out/my-skill     # 源变了就退出码 1
 ```
 
 生成出来的 `SKILL.md` 是固定骨架：是什么/什么时候用 → 核心内容 → 快速开始 → 关键概念 → 参考文件 → 待补充 → 维护。
 
 ## Roadmap
 
-- [ ] `--profile dsh|claude|generic` — target different skill runtimes
+- [x] `--profile dsh|claude|generic` — target different skill runtimes
+- [x] `diff` — detect outdated skills by hashing source files
+- [x] `fix` — auto-repair the mechanical lint failures
+- [x] `--dry-run` — preview before writing
 - [ ] `--from-tests` — derive `whenToUse` from example user queries
-- [ ] `diff` — detect outdated skills by hashing source files
-- [ ] `--fix` — auto-repair the mechanical lint failures (name, missing refs links)
 - [ ] PDF layout handling beyond text extraction (`pypdf` optional)
+- [ ] `build --watch` — regenerate on source change
 
 ## License
 

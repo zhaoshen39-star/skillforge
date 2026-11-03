@@ -19,11 +19,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
       - name: Self-check (offline fixture)
         run: python skillforge.py selftest
+
       - name: Test suite
         run: python tests/verify_skillforge.py
+
       - name: Smoke build from this repo
         run: python skillforge.py build . -o out/self-skill --force
+
+      - name: Dry run (must not write)
+        run: python skillforge.py build . -o out/preview --dry-run
+
       - name: Lint generated package
         run: python skillforge.py lint out/self-skill
+
+      - name: Auto-fix is a no-op on a healthy package
+        run: python skillforge.py fix out/self-skill
+
+      - name: Generated package is in sync with source
+        run: python skillforge.py diff out/self-skill
+
+      - name: Score gate (CI threshold)
+        run: python skillforge.py score out/self-skill --min 90
