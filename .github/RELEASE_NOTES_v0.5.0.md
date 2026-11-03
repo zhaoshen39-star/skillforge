@@ -4,10 +4,11 @@
 Zero dependencies, reproducible output, 120 offline tests.
 
 ```bash
-pipx install skillforge        # or: git clone … && python skillforge.py --help
-skillforge build . -o out/myskill
-skillforge lint out/myskill
-skillforge install out/myskill --target dsh
+git clone https://github.com/zhaoshen39-star/skillforge.git
+cd skillforge
+python skillforge.py --help          # build / lint / fix / diff / install / scan / score / selftest
+python skillforge.py build . -o out/myskill
+python skillforge.py lint out/myskill
 ```
 
 ## Highlights
@@ -45,6 +46,7 @@ skillforge install out/myskill --target dsh
 ### Verification
 
 - 120 offline checks (`python tests/verify_skillforge.py`) + 11 built-in `selftest` checks.
+- CI green on ubuntu-latest and windows-latest × Python 3.9 / 3.12.
 - Self-build: `skillforge build .` → 100/100, `lint` passes, `diff` reports all 11 sources in sync.
 - Real `--watch` run: edit source → rebuild detected and emitted, clean exit.
 - Real PDF run: 3-page PDF with repeating headers → page markers correct, headers removed, build 100/100.
